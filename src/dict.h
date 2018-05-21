@@ -16,9 +16,9 @@ typedef struct dictType{
     unsigned int (*hashFunction)(const void *key);
     void *(*keyDup)(void *privdata, const void *key);
     void *(*valDup)(void *privdata, const void *obj);
-    void *(*keyCompare)(void *privdata, const void *key1, const void *key2);
-    void *(*keyDestructor)(void *privdata, const void *key);
-    void *(*valDestructor)(void *privdata, const void *obj);
+    int (*keyCompare)(void *privdata, const void *key1, const void *key2);
+    void (*keyDestructor)(void *privdata, const void *key);
+    void (*valDestructor)(void *privdata, const void *obj);
 } dictType;
 
 typedef struct dict{
@@ -32,7 +32,7 @@ typedef struct dict{
 
 typedef struct dictIterator{
     dict *ht;
-    int index;
+    int index;  //当前桶索引
     dictEntry *entry;
     dictEntry *nextEntry;
 } dictIterator;
@@ -62,10 +62,10 @@ typedef struct dictIterator{
         (entry)->key = (_key_);  \
 } while(0)
 
-#define dictCompareHashKey(ht, key1, key2) \
-    ((ht)->type->keyCompare) ? \
-        (ht)->type->keyCompare((ht)->privdata, key1, key2)  :   \
-        (key1 == key2))
+#define dictCompareHashKeys(ht, key1, key2) \
+    (((ht)->type->keyCompare) ? \
+        (ht)->type->keyCompare((ht)->privdata, key1, key2) : \
+        (key1) == (key2))
 
 #define dictHashKey(ht, key) (ht)->type->hashFunction(key)
 
@@ -76,7 +76,7 @@ typedef struct dictIterator{
 
 /*--------------------函数定义----------------------*/
 dict *dictCreate(dictType *type, void *privDataPtr);    //初始化
-int dictExtend(dict *ht, unsigned int size);    //扩展桶数
+int dictExpand(dict *ht, unsigned int size);    //扩展桶数
 int dictAdd(dict *ht, void *key, void *val);    //增加键值对
 int dictReplace(dict *ht, void *key, void *val);    //修改键值对
 int dictDelete(dict *ht, void *key);    //删除键
@@ -87,7 +87,7 @@ int dictResize(dict *ht);
 dictIterator *dictGetIterator(dict *ht);    //返回迭代器
 dictEntry *dictNext(dictIterator *iter);    //迭代下一个entry
 void dictReleaseIterator(dictIterator *iter);
-dictEntry dictGetRandomKey(dict *ht);
+dictEntry *dictGetRandomKey(dict *ht);
 void dictPrintStats(dict *ht);
 unsigned int dictGenHashFunction(const unsigned char *buf, int len);    //未知
 
