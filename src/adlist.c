@@ -1,5 +1,6 @@
 #include "adlist.h"
 #include <stdlib.h>
+#include <stdio.h>
 
 list *listCreate(void){
     list *l = malloc(sizeof(*l));
