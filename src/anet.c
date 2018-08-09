@@ -60,6 +60,47 @@ int anetWrite(int fd, void *buf, int count){
 }
 
 /**
+ * 给socket开启非阻塞
+ */ 
+int anetNonBlock(char *err, int fd){
+    int flags;
+    if((flags = fcntl(fd, F_GETFD)) == -1){
+        anetSetError(err, "fcntl(F_GETFL): %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    if(fcntl(fd, F_SETFD, flags | O_NONBLOCK) == -1){
+        anetSetError(err, "fcntl(F_SETFL, O_NONBLOCK): %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    return ANET_OK;
+}
+
+/**
+ * 给tcp开启NoDelay
+ */ 
+int anetTcpNoDelay(char *err, int fd){
+    int on = 1;
+    if(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) == -1){
+        anetSetError(err, "setsockopt TCP_NODELAY: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    return ANET_OK;
+}
+
+/**
+ * 给socket重新设置sendBufferSize
+ */ 
+int anetSetSendBuffer(char *err, int fd, int bufferSize){
+    if(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize)) == -1){
+        anetSetError(err, "setsockopt SO_SNDBUF: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    return ANET_OK;
+}
+
+int anetSetSendBuffer(char *err, int fd, int bufferSize)
+
+/**
  * 连接给定的addr和port端口，用的是新版的API重写，而不是redis自己默认的老版本
  */ 
 int anetTcpConnect(char *err, char *addr, int port){
@@ -71,13 +112,14 @@ int anetTcpConnect(char *err, char *addr, int port){
     hints.ai_addr = NULL;
     hints.ai_next = NULL;
     hints.ai_family = AF_INET;  //只支持IPv4
-    hints.ai_socktype = SOCK_DGRAM; //只支持TCP流
+    hints.ai_socktype = SOCK_STREAM; //只支持TCP流
     hints.ai_flags = AI_NUMERICSERV;    //service只能是数字，不需要走转换
     struct addrinfo *result, *rp;
 
     //要将port转换成字符串形式，最多5+1位就够了
     char portBuf[6];
-    snprintf(portBuf, sizeof(portBuf), htons(port));
+    snprintf(portBuf, sizeof(portBuf), "%d", port);
+    portBuf[5] = '\0';
     int s =  getaddrinfo(addr, portBuf, &hints, &result);
     if(s != 0){
         anetSetError(err, "getaddrinfo: %s\n", strerror(errno));
@@ -115,13 +157,15 @@ int anetTcpServer(char *err, int port, char *bindaddr){
     hints.ai_addr = NULL;
     hints.ai_next = NULL;
     hints.ai_family = AF_INET;  //只支持IPv4
-    hints.ai_socktype = SOCK_DGRAM; //只支持TCP流
+    hints.ai_socktype = SOCK_STREAM; //只支持TCP流
     if(!bindaddr)   hints.ai_flags = AI_PASSIVE;    //没传bindaddr，则自动使用通配符IP
     struct addrinfo *result, *rp;
 
     //要将port转换成字符串形式，最多5+1位就够了
     char portBuf[6];
-    snprintf(portBuf, sizeof(portBuf), htons(port));
+    
+    snprintf(portBuf, sizeof(portBuf), "%d", port);
+    portBuf[5] = '\0';
     int s;
     if(bindaddr){
         s = getaddrinfo(bindaddr, portBuf, &hints, &result);
@@ -152,7 +196,8 @@ int anetTcpServer(char *err, int port, char *bindaddr){
         close(sfd); 
     }
     
-    if(rp == NULL){
+    freeaddrinfo(result);   //这里必须回收
+    if(rp == NULL){ //说明sfd没弄到值，不用close
         anetSetError(err, "bind: %s\n", strerror(errno));
         return ANET_ERR;
     }
@@ -174,8 +219,9 @@ int anetTcpServer(char *err, int port, char *bindaddr){
 int anetAccept(char *err, int serversock, char *ip, int *port){
     int cfd;
     struct sockaddr_storage claddr;
+    socklen_t addrLen = sizeof(struct sockaddr_storage);
     while(true){
-        cfd = accept(serversock, (struct sockaddr *)&claddr, sizeof(struct sockaddr_storage));
+        cfd = accept(serversock, (struct sockaddr *)&claddr, &addrLen);
         if(cfd == -1){
             if(errno == EINTR){
                 continue;
@@ -188,17 +234,21 @@ int anetAccept(char *err, int serversock, char *ip, int *port){
     }
     //不管要不要，都尝试获取客户端地址，然后按需填充
     char host[NI_MAXHOST], service[NI_MAXSERV];
-    if(getnameinfo(&claddr, sizeof(struct sockaddr_storage), host, NI_MAXHOST, 
-                    service, NI_MAXSERV, (NI_NUMERICHOST | NI_NUMERICSERV)) == 0){
+    if(getnameinfo((struct sockaddr *)&claddr, sizeof(struct sockaddr_storage), host, NI_MAXHOST, 
+                    service, NI_MAXSERV, NI_NUMERICHOST | NI_NUMERICSERV) == 0){
         if(ip){
-            snprintf(ip, NI_MAXHOST, host);
+            strncpy(ip, host, NI_MAXHOST);
+            ip[NI_MAXHOST - 1] = '\0';
         }
         if(port){
             *port = atoi(service);
+            /* strncpy(port, service, NI_MAXSERV);
+            port[NI_MAXSERV - 1] = '\0'; */
         }
     }else{  //获取失败
         if(ip){
-            snprintf(ip, NI_MAXHOST, "(?UNKNOWN?)");
+            strncpy(ip, "(?UNKNOWN?)", NI_MAXHOST);
+            ip[NI_MAXHOST - 1] = '\0';
         }
         if(port){
             *port = 0;
@@ -208,3 +258,66 @@ int anetAccept(char *err, int serversock, char *ip, int *port){
     return cfd;
 }
 
+/**
+ * 将传来的主机名，尝试转换成数字格式的IPv4地址，保存在ipbuf缓冲区中
+ */ 
+int anetResolve(char *err, char *host, char *ipbuf){
+    
+    //先根据host获取地址结构
+    //初始化
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_canonname = NULL;
+    hints.ai_addr = NULL;
+    hints.ai_next = NULL;
+    hints.ai_family = AF_INET;  //只支持IPv4
+    hints.ai_socktype = SOCK_STREAM; //只支持TCP流
+  
+    struct addrinfo *result;
+    int s = getaddrinfo(host, NULL, &hints, &result);
+    if(s != 0){
+        anetSetError(err, "getaddrinfo: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    //将结构中IP地址转换成可读字符串，不循环了直接来
+    //inet_ntop(AF_INET, result->ai_addr, ipbuf, result->ai_addrlen);
+    if(getnameinfo(result->ai_addr, result->ai_addrlen, ipbuf, NI_MAXHOST, 
+                    NULL, 0, NI_NUMERICHOST) == 0){
+        freeaddrinfo(result);
+        return ANET_OK;
+    }else{  //获取失败
+        freeaddrinfo(result);
+        anetSetError(err, "getnameinfo: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+    
+}
+
+int main(int argc, char *argv[]){
+
+    char err[ANET_ERR_LEN];
+
+    //测试anetResolve函数
+    /* printf("test anetResolve function\n");
+    char ipbuf[INET_ADDRSTRLEN];
+    int result = anetResolve(err, "eucita.com", ipbuf);
+    printf("anetResolve returned: %d\n", result);
+    printf("ipbuf: %s\n", ipbuf); */
+
+    //测试anetTcpServer和accpet函数
+    /* printf("test anetTcpServer...\n");
+    int sfd = anetTcpServer(err, 33389, NULL);
+    printf("test anetTcpServer ok, sdf=%d\n", sfd);
+
+    printf("test anetTcpAccpet...\n");
+    char host[NI_MAXHOST];
+    //char port[NI_MAXSERV];
+    int port = 0;
+    int cfd = anetAccept(err, sfd, host, &port);
+    printf("test anetTcpAccpet ok, cfd=%d, clientIp=%s, clientPort=%d\n", cfd, host, port);  */
+
+    //测试anetTcpConnect函数
+    printf("test anetTcpConnect...\n");
+    int sfd2 = anetTcpConnect(err, "127.0.0.1", 33389);
+    printf("test anetTcpConnect ok, sfd2=%d\n", sfd2); 
+}
