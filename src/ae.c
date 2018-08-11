@@ -51,4 +51,31 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
     return AE_OK;
 }
 
+/**
+ * 删除特定的FileEvent，删一个就会退出
+ */ 
+void aeDeleteEventLoop(aeEventLoop *eventLoop, int fd, int mask){
+    
+    aeFileEvent *prev = NULL;
+    aeFileEvent *fe = eventLoop->fileEventHead;
+    //从头挨个找
+    while(fe){
+        if(fe->fd == fd && fe->mask == mask){
+            if(prev == NULL){   //说明是首元素
+                eventLoop->fileEventHead = fe->next;
+            }else{  //说明不是首元素，prev一定有值
+                prev->next = fe->next;
+            }
+            if(fe->finalizeProc){
+                fe->finalizeProc(eventLoop, fe->clientData);
+            }
+            free(fe);
+            return;
+        }
+        //不是就尝试下一个，需要记住上一个结构
+        prev = fe;
+        fe = fe->next;
+    }
+}
+
 
