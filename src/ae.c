@@ -78,4 +78,33 @@ void aeDeleteEventLoop(aeEventLoop *eventLoop, int fd, int mask){
     }
 }
 
+/**
+ * 取当前时间，填充传入的秒和毫秒缓冲区
+ */ 
+static void aeGetTime(long *seconds, long *milliseconds){
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    *seconds = tv.tv_sec;
+    *milliseconds = tv.tv_usec / 1000;  //usec是微秒，需要转成毫秒
+}
+
+/**
+ * 将传入的时间缓冲区，增加毫秒数
+ */ 
+static void adAddMillisecondsToNow(long long milliseconds, long *sec, long *ms){
+    long currentSeconds, currentMilliSeconds;
+    //long whenSeconds, whenMilliSeconds;
+    //获取当前时间
+    aeGetTime(&currentSeconds, &currentMilliSeconds);
+    long whenSeconds = currentSeconds + milliseconds / 1000;
+    long whenMilliSeconds = currentMilliSeconds + milliseconds % 1000; 
+    //增加完毕，需要将毫秒进位到秒
+    if(whenMilliSeconds >= 1000){
+        whenSeconds++;
+        whenMilliSeconds -= 1000;
+    }
+    *sec = whenSeconds;
+    *ms = whenMilliSeconds;
+}
+
 
