@@ -137,7 +137,7 @@ struct sharedObjectsStruct{
 static lobj *createObject(int type, void *ptr);
 static lobj *createListObject(void);
 static void incrRefCount(lobj *o);
-static void decrRefCount(void *o);
+static void decrRefCount(void *obj);
 static void freeStringObject(lobj *o);
 static void freeListObject(lobj *o);
 static void freeSetObject(lobj *o);
@@ -193,7 +193,7 @@ static unsigned int sdsDictHashFunction(const void *key){
 /**
  * 完全一样则返回1,否则返回0
  */ 
-static int sdsDictCompare(void *privdata, const void *key1, const void *key2){
+static int sdsDictKeyCompare(void *privdata, const void *key1, const void *key2){
     
     DICT_NOTUSED(privdata);
     int l1 = sdslen((sds)key1);
@@ -207,6 +207,70 @@ static void sdsDictKeyDestructor(void *privdata, void *key){
     sdsfree(key);
 }
 
+static void sdsDictValDestructor(void *privdata, void *val){
+    DICT_NOTUSED(privdata);
+    decrRefCount(val);
+}
+
+dictType sdsDictType = {
+    sdsDictHashFunction,    //hash函数
+    NULL,                   //keyDup函数
+    NULL,                   //valDup函数
+    sdsDictKeyCompare,      //keyCompare函数
+    sdsDictKeyDestructor,   //key清理函数
+    sdsDictValDestructor,   //val清理函数
+};
+
+/*========================= server相关实现 ===============================*/
+
+/**
+ * 重置server的saveparams全局结构
+ */ 
+static void ResetServerSaveParams(){
+    free(server.saveparams);
+    server.saveparams = NULL;
+    server.saveparamslen = 0;
+}
+
+/**
+ * 给server的saveparams增加一项可能性
+ */ 
+static void appendServerSaveParams(time_t seconds, int changes){
+    server.saveparams = realloc(server.saveparams, sizeof(struct saveparam)*(server.saveparamslen+1));
+    if(server.saveparams == NULL)   oom("appendServerSaveParams");
+    server.saveparams[server.saveparamslen].seconds = seconds;
+    server.saveparams[server.saveparamslen].changes = changes;
+    server.saveparamslen++;
+}
+
+/**
+ * 初始化server结构的各项配置参数，只会在启动时会调用
+ */ 
+static void initServerConfig(){
+    server.dbnum = LEDIS_DEFAULT_DBNUM;
+    server.port = LEDIS_SERVERPORT;
+    server.verbosity = LEDIS_DEBUG;
+    server.maxidletime = LEDIS_MAXIDLETIME;
+    server.saveparams = NULL;
+    server.logfile = NULL;  //到后面再设定
+
+    ResetServerSaveParams();
+}
+
+/**
+ * 创建需要的常量obj们
+ */ 
+static void createSharedObjects(void){
+    shared.crlf = createObject(LEDIS_STRING, sdsnew("\r\n"));
+    shared.ok = createObject(LEDIS_STRING, sdsnew("+OK\r\n"));
+    shared.err = createObject(LEDIS_STRING, sdsnew("-ERR\r\n"));
+    shared.zerobulk = createObject(LEDIS_STRING, sdsnew("0\r\n\r\n"));
+    shared.nil = createObject(LEDIS_STRING, sdsnew("nil\r\n"));
+    shared.zero = createObject(LEDIS_STRING, sdsnew("0\r\n"));
+    shared.one = createObject(LEDIS_STRING, sdsnew("1\r\n"));
+    shared.pong = createObject(LEDIS_STRING, sdsnew("+PONG\r\n"));
+}
+
 /*========================= ledis对象相关实现 ===============================*/
 
 /**
@@ -217,7 +281,7 @@ static lobj *createObject(int type, void *ptr){
     if(listLength(server.objfreelist)){
         listNode *head = listFirst(server.objfreelist);
         o = listNodeValue(head);
-        //必须从复用链表里删除
+        //必须从复用链表里删除，listCreate时是没有free函数传递的，所以只是修改了结构而已
         listDelNode(server.objfreelist, head);
     }else{
         o = malloc(sizeof(*o));
@@ -234,5 +298,76 @@ static lobj *createObject(int type, void *ptr){
  * 创建一个list类型的对象
  */ 
 static lobj *createListObject(void){
+    list *l = listCreate();
+    if(!l)  oom("createListObject");
+    listSetFreeMethod(l, decrRefCount); //重要一步，所有的obj都要绑定decrRefCount函数
+    return createObject(LEDIS_LIST, l);
+}
 
+/**
+ * 给obj的ref引用计数加1
+ */ 
+static void incrRefCount(lobj *o){
+    o->refcount++;
+}
+
+/**
+ * 给obj的ref引用计数减1,如果变成0,则调用相应类型的free
+ */ 
+static void decrRefCount(void *obj){
+    lobj *o = obj;
+    if(--(o->refcount) == 0){
+        switch(o->type){
+            case LEDIS_STRING : freeStringObject(o);    break;
+            case LEDIS_LIST : freeListObject(o);    break;
+            case LEDIS_SET : freeSetObject(o);    break;
+            default : assert(0 != 0);   break;
+        }
+        //引用为0,只是free里面的ptr数据，obj本身会加入到free列表首部，等待复用
+        if(!listAddNodeHead(server.objfreelist, o)){
+            free(o);
+        }
+    }
+}
+
+/**
+ * 释放sds动态字符串类型的obj
+ */ 
+static void freeStringObject(lobj *o){
+    sdsfree(o->ptr);
+}
+
+/**
+ * 释放list链表类型的obj
+ */ 
+static void freeListObject(lobj *o){
+    listRelease((list*)o->ptr);
+}
+
+/**
+ * 释放set类型的obj
+ */ 
+static void freeSetObject(lobj *o){
+    //什么也不做，此版本没有set这个类型
+    o = o;
+}
+
+int main(int argc, char *argv[]){
+
+    //初始化server配置
+    //初始化server
+    if(argc == 2){  //制定了logfile
+
+    }else if(argc > 2){
+        fprintf(stderr, "Usage: ./ledis-server [/path/to/ledis.conf]\n");
+        exit(EXIT_FAILURE);
+    }
+    ledisLog(LEDIS_NOTICE, "Server started");
+    //尝试恢复数据库dump.ldb文件
+
+    //基于server的fd，创建fileEvent
+    ledisLog(LEDIS_NOTICE, "The server is now ready to accept connections");
+    aeMain(server.el);  //开始轮询，直到el的stop被置位
+    aeDeleteEventLoop(server.el);
+    exit(EXIT_SUCCESS);
 }
