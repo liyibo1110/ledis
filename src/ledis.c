@@ -96,11 +96,11 @@ struct saveparam{
 struct ledisServer{
     int port;
     int fd;
-    dict **dict;    //内存存储的指针数组
+    dict **dict;    //内存存储的指针数组，和dbnum相关，即默认16个元素
     long long dirty;    //自从上次save后经历的变更数
     list *clients;  //客户端链表
 
-    char netarr[ANET_ERR_LEN];
+    char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
     int verbosity;  //log的输出等级
     int cronloops;
@@ -108,7 +108,7 @@ struct ledisServer{
 
     int dbnum;
     list *objfreelist;  //复用lobj对象的池子链表
-    int bgsaveinprogress;
+    int bgsaveinprogress;   //是否正在bgsave，其实是个bool
     time_t lastsave;
     struct saveparam *saveparams;
     
@@ -224,12 +224,12 @@ dictType sdsDictType = {
 /*========================= server相关实现 ===============================*/
 
 /**
- * 重置server的saveparams全局结构
+ * timeEvent的回调函数，此版本是每隔1秒执行一次，但不是准确的
  */ 
-static void ResetServerSaveParams(){
-    free(server.saveparams);
-    server.saveparams = NULL;
-    server.saveparamslen = 0;
+int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
+    
+    int loops = server.cronloops++; //当前循环次数
+    return 1000;
 }
 
 /**
@@ -244,6 +244,15 @@ static void appendServerSaveParams(time_t seconds, int changes){
 }
 
 /**
+ * 重置server的saveparams全局结构
+ */ 
+static void ResetServerSaveParams(){
+    free(server.saveparams);
+    server.saveparams = NULL;
+    server.saveparamslen = 0;
+}
+
+/**
  * 初始化server结构的各项配置参数，只会在启动时会调用
  */ 
 static void initServerConfig(){
@@ -255,6 +264,67 @@ static void initServerConfig(){
     server.logfile = NULL;  //到后面再设定
 
     ResetServerSaveParams();
+    //给默认的配置
+    appendServerSaveParams(60*60, 1);   //1小时后要达到1次变动即save
+    appendServerSaveParams(300, 100);   //5分钟后要达到100次变动即save
+    appendServerSaveParams(60, 10000);  //1分钟后要达到10000次变动即save
+}
+
+/**
+ * 初始化server结构自身功能，只会在启动时调用
+ */ 
+static void initServer(){
+
+    //忽略hup和pipe信号的默认行为（终止server进程）
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+
+    server.clients = listCreate();
+    server.objfreelist = listCreate();
+    createSharedObjects();
+    server.el = aeCreateEventLoop();
+    //初始化dict数组，只是分配了dbnum个地址空间，并没有为实际dict结构分配内存
+    server.dict = malloc(sizeof(dict*)*server.dbnum);
+    if(!server.dict || !server.clients || !server.el || !server.objfreelist){
+        oom("server initialization");
+    }
+    server.fd = anetTcpServer(server.neterr, server.port, NULL);
+    if(server.fd == -1){
+        ledisLog(LEDIS_WARNING, "Opening TCP port: %s", server.neterr);
+        exit(EXIT_FAILURE);
+    }
+    //继续给dict数组内部真实分配
+    for(int i = 0; i < server.dbnum; i++){
+        server.dict[i] = dictCreate(&sdsDictType, NULL);
+        if(!server.dict[i]){
+            oom("server initialization");
+        }
+    }
+    server.cronloops = 0;
+    server.bgsaveinprogress = 0;
+    server.lastsave = time(NULL);
+    server.dirty = 0;
+    aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
+}
+
+/**
+ * 从配置文件中加载，此版本实现的比较低端
+ */ 
+static void loadServerConfig(char *filename){
+    FILE *fp = fopen(filename, "r");
+    char buf[LEDIS_CONFIGLINE_MAX+1], *err = NULL;
+    int linenum = 0;
+    sds line = NULL;
+
+    if(!fp){
+        ledisLog(LEDIS_WARNING, "Fatal error, can't open config file");
+        exit(EXIT_FAILURE);
+    }
+
+    //开始按行读取
+    while(fgets(buf, LEDIS_CONFIGLINE_MAX+1, fp) != NULL){
+
+    }
 }
 
 /**
@@ -355,9 +425,13 @@ static void freeSetObject(lobj *o){
 int main(int argc, char *argv[]){
 
     //初始化server配置
+    initServerConfig();
     //初始化server
-    if(argc == 2){  //制定了logfile
-
+    initServer();
+    if(argc == 2){  //制定了conf文件
+        ResetServerSaveParams();    //清空saveparams字段
+        loadServerConfig(argv[1]);
+        ledisLog(LEDIS_NOTICE, "Configuration loaded");
     }else if(argc > 2){
         fprintf(stderr, "Usage: ./ledis-server [/path/to/ledis.conf]\n");
         exit(EXIT_FAILURE);
