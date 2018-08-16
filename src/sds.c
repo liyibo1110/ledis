@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <ctype.h>
 
 /**
@@ -128,6 +130,35 @@ sds sdscpy(sds s, char *t){
     return sdscpylen(s, t, strlen(t));
 }
 
+sds sdscatprintf(sds s, const char *fmt, ...){
+    
+    va_list ap;
+    char *buf;
+    size_t buflen = 32;
+
+    va_start(ap, fmt);
+    while(true){
+        buf = malloc(buflen);
+#ifdef SDS_ABORT_ON_OOM
+        if(buf == NULL) sdsOomAbort();
+#else
+        if(buf == NULL) return NULL;
+#endif
+        buf[buflen-2] = '\0';   //将倒数第二个字节打个标记，用来观察目前容量是否够用
+        vsnprintf(buf, buflen, fmt, ap);
+        if(buf[buflen-2] != '\0'){  //说明传入的字符串装不下，需要加倍后重来
+            free(buf);
+            buflen *= 2;
+            continue;
+        }
+        break;
+    }
+    va_end(ap);
+    char *t = sdscat(s, buf);
+    free(buf);
+    return t;
+}
+
 sds sdstrim(sds s, const char *cset){
     struct sdshdr *sh = (void *)(s - sizeof(struct sdshdr));
     char *start = s;    //不变
@@ -196,6 +227,73 @@ int sdscmp(sds s1, sds s2){
     int cmp = memcmp(s1, s2, minlen);
     if(cmp == 0) return l1-l2;  //如果前面都相等，则按长度比较
     return cmp;
+}
+
+/**
+ * 调用者需要负责将返回的数组free
+ */ 
+sds *sdssplitlen(char *s, int len, char *sep, int seplen, int *count){
+    int elements = 0, slots = 5, start = 0;  
+    sds *tokens = malloc(sizeof(sds)*slots);
+#ifdef SDS_ABORT_ON_OOM
+    if(tokens == NULL)  sdsOomAbort();
+#endif
+
+    //检查入参
+    if(seplen < 1 || len < 0 || tokens == NULL) return NULL;
+    int i;
+    for(i = 0; i < (len-(seplen-1)); i++){
+        if(slots < elements+2){ //数组不够了，则要动态调整
+            slots *= 2;
+            sds *newtokens = realloc(tokens, sizeof(sds)*slots);
+            if(newtokens == NULL) {
+#ifdef SDS_ABORT_ON_OOM
+                sdsOomAbort();
+#else
+                goto cleanup;
+#endif
+            } 
+            tokens = newtokens;
+        }
+
+        //开始寻找分隔符，分2组，sep为单字符/多字符
+        if((seplen == 1 && *(s+i) == sep[0]) || (memcmp(s+i, sep, seplen) == 0)){
+            //找到了，要将分隔符前面的字符串截取出来
+            tokens[elements] = sdsnewlen(s+start, i-start);
+            if(tokens[elements] == NULL) {
+#ifdef SDS_ABORT_ON_OOM
+                sdsOomAbort();
+#else
+                goto cleanup;
+#endif
+            } 
+            elements++;
+            start = i + seplen;
+            i = i+seplen-1;
+        }
+    }
+    //最后还剩最后一个分隔符后面的字符串
+    tokens[elements] = sdsnewlen(s+start, len-start);
+    if(tokens[elements] == NULL) {
+#ifdef SDS_ABORT_ON_OOM
+        sdsOomAbort();
+#else
+        goto cleanup;
+#endif
+    } 
+    elements++;
+    *count = elements;  //写的不好
+    return tokens;
+
+#ifndef SDS_ABORT_ON_OOM
+cleanup:{
+    for(int i = 0; i < elements; i++){
+        sdsfree(tokens[i]);
+    }
+    free(tokens);   //都得清理
+    return NULL;
+}
+#endif
 }
 
 /* int main(void){

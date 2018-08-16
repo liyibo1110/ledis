@@ -34,8 +34,8 @@
 #define LEDIS_CONFIGLINE_MAX    1024    //1k
 
 /*========== Hash table 相关==========*/
-#define LEDIS_HT_MINFILL    10  //百分数
-#define LEDIS_HT_MINSLOTS   16384   //最小容量
+#define LEDIS_HT_MINFILL    10  //dict实际占用百分数，小于这个比率就会尝试再收缩（前提是扩张过）
+#define LEDIS_HT_MINSLOTS   16384   //最小容量，如果不扩长，也就不会继续收缩
 
 
 /*========== 返回错误代码 ==========*/
@@ -224,11 +224,72 @@ dictType sdsDictType = {
 /*========================= server相关实现 ===============================*/
 
 /**
- * timeEvent的回调函数，此版本是每隔1秒执行一次，但不是准确的
+ * 关闭所有超时的客户端，在别的文件里调用，不能是static函数
+ */ 
+void closeTimedoutClients(void){
+    time_t now = time(NULL);
+    listIter *li = listGetIterator(server.clients, AL_START_HEAD);
+    if(!li) return;
+    listNode *ln;
+    ledisClient *c;
+    while((ln = listNextElement(li)) != NULL){
+        c = listNodeValue(ln);
+        //检查上次交互的时间
+        if(now - c->lastinteraction > server.maxidletime){
+            ledisLog(LEDIS_DEBUG, "Closing idle client");
+            //关闭client
+            freeClient(c);
+        }
+    }
+    listReleaseIterator(li);
+}
+
+/**
+ * timeEvent的回调函数，此版本是每隔1秒执行一次，但不是精确的
  */ 
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     
+    //此版本所有入参都没用到
+    LEDIS_NOTUSED(eventLoop);
+    LEDIS_NOTUSED(id);
+    LEDIS_NOTUSED(clientData);
+
     int loops = server.cronloops++; //当前循环次数
+    int size, used;
+    //尝试收缩每个HT
+    for(int i = 0; i < server.dbnum; i++){
+        //获取总量和实际使用量
+        size = dictGetHashTableSize(server.dict[i]);
+        used = dictGetHashTableUsed(server.dict[i]);
+        //差不多每5秒尝试输出一下上述状态
+        if(!(loops % 5) && used > 0){
+            ledisLog(LEDIS_DEBUG, "DB %d: %d keys in %d slots HT.", i, used, size);
+        }
+        
+        if(size && used && size > LEDIS_HT_MINSLOTS && 
+            (used * 100 / size < LEDIS_HT_MINFILL)){
+            ledisLog(LEDIS_NOTICE, "The hash table %d is too sparse, resize it...", i);
+            dictResize(server.dict[i]);
+            ledisLog(LEDIS_NOTICE, "Hash table %d resized.", i);
+        }
+    }    
+
+    //差不多每10秒，尝试清理超时的client
+    if(!(loops % 5)){
+        ledisLog(LEDIS_DEBUG, "%d clients connected", listLength(server.clients));
+    }
+
+    if(!(loops % 10)){
+        closeTimedoutClients();
+    }
+
+    //尝试bgsave，暂不实现
+    if(server.bgsaveinprogress){
+        //如果正在bgsave，则阻塞
+    }else{
+        //检测是否需要bgsave
+    }
+
     return 1000;
 }
 
@@ -308,7 +369,7 @@ static void initServer(){
 }
 
 /**
- * 从配置文件中加载，此版本实现的比较低端
+ * 从配置文件中加载，此版本实现的比较低端，只在启动时被调用一次
  */ 
 static void loadServerConfig(char *filename){
     FILE *fp = fopen(filename, "r");
@@ -321,10 +382,116 @@ static void loadServerConfig(char *filename){
         exit(EXIT_FAILURE);
     }
 
-    //开始按行读取
+    //开始按行读取，fgets额外会存储换行符\n
     while(fgets(buf, LEDIS_CONFIGLINE_MAX+1, fp) != NULL){
+        sds *argv;  //配置项数组，成对儿出现
+        int argc;   //配置项元素数目，比如2个（key和value），可以用来检测配置合法
 
+        linenum++;
+        line = sdsnew(buf);
+        line = sdstrim(line, " \t\r\n");
+        //跳过注释和空白行
+        if(line[0] == '#' || line[0] == '\0'){
+            sdsfree(line);
+            continue;
+        }
+        argv = sdssplitlen(line, sdslen(line), " ", 1, &argc);
+
+        //开始实施这一行的配置
+        if(!strcmp(argv[0], "timeout") && argc == 2){
+            server.maxidletime = atoi(argv[1]);
+            if(server.maxidletime < 1){
+                err = "Invalid timeout value";
+                goto loaderr;
+            }
+        }else if(!strcmp(argv[0], "save") && argc == 3){
+            int seconds = atoi(argv[1]);
+            int changes = atoi(argv[2]);
+            if(seconds < 1 || changes < 0){
+                err = "Invalid save parameters";
+                goto loaderr;
+            }
+            appendServerSaveParams(seconds, changes);
+        }else if(!strcmp(argv[0], "dir") && argc == 2){
+            if(chdir(argv[1]) == -1){
+                ledisLog(LEDIS_WARNING, "Can't chdir to '%s': %s", argv[1], strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+        }else if(!strcmp(argv[0], "loglevel") && argc == 2){
+            if(!strcmp(argv[1], "debug")){
+                server.verbosity = LEDIS_DEBUG;
+            }else if(!strcmp(argv[1], "notice")){
+                server.verbosity = LEDIS_NOTICE;
+            }else if(!strcmp(argv[1], "warning")){
+                server.verbosity = LEDIS_WARNING;
+            }else{
+                err = "Invalid log level. Must be one of debug, notice, warning";
+                goto loaderr;
+            }
+        }else if(!strcmp(argv[0], "logfile") && argc == 2){
+            server.logfile = strdup(argv[1]);   //需要复制字符串，因为argv是函数范围
+            if(!strcmp(server.logfile, "stdout"))   server.logfile = NULL;
+            if(server.logfile){
+                //如果不是stdout，则需要在这里测试一下文件的可读写性
+                FILE *fp = fopen(server.logfile, "a");
+                if(fp == NULL){
+                    //为啥不用sscanf
+                    err = sdscatprintf(sdsempty(), 
+                        "Can't open the log file: %s", strerror(errno));
+                    goto loaderr;
+                }
+                fclose(fp);
+            }
+        }else if(!strcmp(argv[0], "databases") && argc ==2){
+            //dbnum的值在这里可能变了，但是dict数组已经在之前已经分配16组空间了，疑似BUG
+            server.dbnum = atoi(argv[1]);
+            if(server.dbnum < 1){
+                err = "Invalid number of databases";
+                goto loaderr;
+            }
+        }else{
+            err = "Bad directive or wrong number of arguments";
+            goto loaderr;
+        }
+        sdsfree(line);
     }
+    fclose(fp);
+    return;
+
+loaderr:{
+    fprintf(stderr, "\n***FATAL CONFIG FILE ERROR ***\n");
+    fprintf(stderr, "Reading the configuration file, at line %d\n", linenum);
+    fprintf(stderr, ">>> '%s'\n", line);
+    fprintf(stderr, "%s\n", err);
+    exit(EXIT_FAILURE);
+}
+}
+
+static void freeClientArgv(ledisClient *c){
+    for(int i = 0; i < c->argc; i++){
+        sdsfree(c->argv[i]);
+    }
+    c->argc = 0;
+}
+
+/**
+ * 清理server.clients里面特定的元素
+ */ 
+static void freeClient(ledisClient *c){
+    //从el中清理相关的fileEvent
+    aeDeleteFileEvent(server.el, c->fd, AE_READABLE);
+    aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+    
+    //清理client各个字段
+    sdsfree(c->querybuf);
+    listRelease(c->reply);
+    freeClientArgv(c);
+    close(c->fd);
+    //最后就可以删除cliens链表的结点了
+    listNode *ln = listSearchKey(server.clients, c);
+    assert(ln != NULL);
+    listDelNode(server.clients, ln);
+    free(c);
 }
 
 /**
@@ -339,6 +506,150 @@ static void createSharedObjects(void){
     shared.zero = createObject(LEDIS_STRING, sdsnew("0\r\n"));
     shared.one = createObject(LEDIS_STRING, sdsnew("1\r\n"));
     shared.pong = createObject(LEDIS_STRING, sdsnew("+PONG\r\n"));
+}
+
+static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask){
+    //此版本只需要使用fd和privdata
+    LEDIS_NOTUSED(el);
+    LEDIS_NOTUSED(mask);
+
+    ledisClient *c = (ledisClient *)privdata;
+    char buf[LEDIS_QUERYBUF_LEN];
+
+    int nread = read(fd, buf, LEDIS_QUERYBUF_LEN);
+    if(nread == -1){
+        if(errno == EAGAIN){
+            nread = 0;
+        }else{
+            ledisLog(LEDIS_DEBUG, "Reading from client: %s", strerror(errno));
+            freeClient(c);
+            return;
+        }
+    }else if(nread == 0){   //说明客户端关闭了
+        ledisLog(LEDIS_DEBUG, "Client closed connection");
+        freeClient(c);
+        return;
+    }
+    if(nread){  //总之真读到了数据才继续
+        c->querybuf = sdscatlen(c->querybuf, buf ,nread);   //是往里面追加
+        c->lastinteraction = time(NULL);
+    }else{
+        return;
+    }
+
+    //开始处理query缓冲区的数据
+again:
+    if(c->bulklen == -1){
+        //只读取一行字符串
+        char *p = strchr(c->querybuf, '\n');
+        size_t querylen;
+        if(p){
+            sds query = c->querybuf;
+            c->querybuf = sdsempty();   //直接清空，注意这里querybuf已经指向了全新的结构，可以对query进行free了
+            querylen = 1+(p-(query));   //还得算上换行符
+            if(sdslen(query) > querylen){
+                //说明c->querybuf有多个换行符（例如pingpong\necho\n），需要保留后面的命令
+                c->querybuf = sdscatlen(c->querybuf, query+querylen, sdslen(query)-querylen);
+            }
+            //处理querybuf得到的命令（不止1条）
+            *p = '\0';  //直接将第一个\n弄成结束符
+            if(*(p-1) == '\r'){
+                *(p-1) = '\0';
+            }
+            //必须重新调整query
+            sdsupdatelen(query);
+
+            //终于可以解析了
+            if(sdslen(query) == 0){
+                sdsfree(query);
+                return;
+            }
+            int argc;
+            sds *argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
+            sdsfree(query); //再见了，c->querybuf已经指向新的结构了
+            if(argv == NULL)    oom("Splitting query in token");
+            for(int i = 0; i < argc && i < LEDIS_MAX_ARGS; i++){
+                if(sdslen(argv[i])){
+                    //终于把命令弄进去了
+                    c->argv[c->argc] = argv[i];
+                    c->argc++;
+                }else{
+                    sdsfree(argv[i]);   //不赋值，则必须立刻回收
+                }
+            }
+            free(argv); //split调用者还要负责回收
+            //开始执行客户端命令
+            if(processCommand(c) && sdslen(c->querybuf))    goto again;
+        }else if(sdslen(c->querybuf) >= 1024){
+            ledisLog(LEDIS_DEBUG, "Client protocol error");
+            freeClient(c);
+            return;
+        }
+    }else{  //处理块数据
+        int qbl = sdslen(c->querybuf);
+    }
+}
+
+/**
+ * 将客户端结构定位相应的dict表索引
+ */ 
+static int selectDb(ledisClient *c, int id){
+    if(id < 0 || id >= server.dbnum){
+        return LEDIS_ERR;
+    }
+    c->dict = server.dict[id];
+    return LEDIS_OK;
+}
+
+static int createClient(int fd){
+    ledisClient *c = malloc(sizeof(*c));
+
+    anetNonBlock(NULL, fd); //开启非阻塞
+    anetTcpNoDelay(NULL, fd);   //开启TCP_NODELAY
+    if(!c)  return LEDIS_ERR;
+    selectDb(c, 0); //将客户端对接0号表
+    //初始化各个字段
+    c->fd = fd;
+    c->querybuf = sdsempty();
+    c->argc = 0;
+    c->bulklen = -1;
+    c->sentlen = 0;
+    c->lastinteraction = time(NULL);
+    if((c->reply = listCreate()) == NULL)   oom("listCreate");
+    listSetFreeMethod(c->reply, decrRefCount);
+    //将client的fd也加入到eventLoop中（存在2种fd，监听新请求/建立起来的客户端后续请求）
+    if(aeCreateFileEvent(server.el, fd, AE_READABLE, readQueryFromClient, c, NULL) == AE_ERR){
+        freeClient(c);
+        return LEDIS_ERR;
+    }
+    //添加到server.clients的尾部
+    if(!listAddNodeTail(server.clients, c)) oom("listAddNodeTail");
+    return LEDIS_OK;
+}
+
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
+
+    //此版本只需要用fd参数
+    LEDIS_NOTUSED(el);
+    LEDIS_NOTUSED(mask);
+    LEDIS_NOTUSED(privdata);
+
+    char cip[128];  //写死的，不太好
+    int cport;
+
+    int cfd = anetAccept(server.neterr, fd, cip, &cport);
+    if(cfd == AE_ERR){
+        ledisLog(LEDIS_DEBUG, "Accepting client connection: %s", server.neterr);
+        return;
+    }
+    //得到客户端fd了
+    ledisLog(LEDIS_DEBUG, "Accepted %s:%d", cip, cport);
+    //根据得到的fd创建client结构
+    if(createClient(cfd) == LEDIS_ERR){
+        ledisLog(LEDIS_WARNING, "Error allocating resoures for the client");
+        close(cfd); //状态此时不一定
+        return;
+    }
 }
 
 /*========================= ledis对象相关实现 ===============================*/
@@ -437,9 +748,13 @@ int main(int argc, char *argv[]){
         exit(EXIT_FAILURE);
     }
     ledisLog(LEDIS_NOTICE, "Server started");
-    //尝试恢复数据库dump.ldb文件
+    //尝试恢复数据库dump.ldb文件，暂不开发
 
     //基于server的fd，创建fileEvent
+    if(aeCreateFileEvent(server.el, server.fd, AE_READABLE,
+            acceptHandler, NULL, NULL) == AE_ERR){
+        oom("creating file event");
+    }
     ledisLog(LEDIS_NOTICE, "The server is now ready to accept connections");
     aeMain(server.el);  //开始轮询，直到el的stop被置位
     aeDeleteEventLoop(server.el);

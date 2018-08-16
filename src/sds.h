@@ -27,7 +27,7 @@ sds sdscat(sds s, char *t); //C字符串直接拼接
 sds sdscpylen(sds s, char *t, size_t len);  //带长度的覆盖
 sds sdscpy(sds s, char *t); //C字符串直接覆盖
 
-//sds sdscatprintf(sds s, const char *fmt, ...);  //带模版的拼接
+sds sdscatprintf(sds s, const char *fmt, ...);  //带模版的拼接
 sds sdstrim(sds s, const char *cset);   //清理首尾2端特定的字符
 sds sdsrange(sds s, long start, long end);  //截取区间字符串
 
