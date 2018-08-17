@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <stdbool.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/select.h>
 
 /**
@@ -93,19 +94,19 @@ static void aeGetTime(long *seconds, long *milliseconds){
  * 将传入的时间缓冲区，增加毫秒数
  */ 
 static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms){
-    long currentSeconds, currentMilliSeconds;
-    //long whenSeconds, whenMilliSeconds;
+    long cur_sec, cur_ms;
+    //long when_sec, when_ms;
     //获取当前时间
-    aeGetTime(&currentSeconds, &currentMilliSeconds);
-    long whenSeconds = currentSeconds + milliseconds / 1000;
-    long whenMilliSeconds = currentMilliSeconds + milliseconds % 1000; 
+    aeGetTime(&cur_sec, &cur_ms);
+    long when_sec = cur_sec + milliseconds/1000;
+    long when_ms = cur_ms + milliseconds%1000; 
     //增加完毕，需要将毫秒进位到秒
-    if(whenMilliSeconds >= 1000){
-        whenSeconds++;
-        whenMilliSeconds -= 1000;
+    if(when_ms >= 1000){
+        when_sec++;
+        when_ms -= 1000;
     }
-    *sec = whenSeconds;
-    *ms = whenMilliSeconds;
+    *sec = when_sec;
+    *ms = when_ms;
 }
 
 /**
@@ -179,7 +180,7 @@ static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop){
 int aeProcessEvents(aeEventLoop *eventLoop, int flags){
 
     //2个event如果都不传，直接退出
-    if((flags & AE_TIME_EVENTS) && (flags & AE_FILE_EVENTS))    return 0;
+    if(!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS))    return 0;
 
     fd_set rfds, wfds, efds;
     //必须先初始化
@@ -203,10 +204,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
         }
     }
 
-    struct timeval tv, *tvp;
+    
     if(numfd || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))){
         //尝试找出最近要到达的1个timeEvent
         aeTimeEvent *shortest = NULL;
+        struct timeval tv, *tvp;
         if(flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT)){
             shortest = aeSearchNearestTimer(eventLoop);
         }
@@ -273,13 +275,15 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
             long now_sec, now_ms;
             long long id;
             aeGetTime(&now_sec, &now_ms);
+
             if(now_sec > te->when_sec ||
                 (now_sec == te->when_sec && now_ms >= te->when_ms)){    //如果timeEvent到期了
+
                 id = te->id;
                 //执行timeEvent相应的处理函数，这里是返回值，是下次到期要增加的毫秒数，如果返回AE_NOMORE则说明event是一次性的，直接清理即可
                 int retval = te->timeProc(eventLoop, id, te->clientData);
                 if(retval != AE_NOMORE){
-                    aeAddMillisecondsToNow(retval, &te->when_sec, &te->when_sec);
+                    aeAddMillisecondsToNow(retval, &te->when_sec, &te->when_ms);
                 }else{
                     aeDeleteTimeEvent(eventLoop, id);
                 }
@@ -303,11 +307,11 @@ void aeMain(aeEventLoop *eventLoop){
     }
 }
 
-int main(int argc, char *argv[]){
+/* int main(int argc, char *argv[]){
     int i = 0;
     int j = i++;
     printf("j=%d\n", j);
     exit(EXIT_SUCCESS);
-}
+} */
 
 

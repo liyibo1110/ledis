@@ -142,6 +142,10 @@ static void freeStringObject(lobj *o);
 static void freeListObject(lobj *o);
 static void freeSetObject(lobj *o);
 
+static void freeClient(ledisClient *c);
+static void addReply(ledisClient *c, lobj *obj);
+static void addReplySds(ledisClient *c, sds s);
+
 //所有函数均只在本文件被调用
 static void echoCommand(ledisClient *c);
 
@@ -291,6 +295,20 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     }
 
     return 1000;
+}
+
+/**
+ * 创建需要的常量obj们
+ */ 
+static void createSharedObjects(void){
+    shared.crlf = createObject(LEDIS_STRING, sdsnew("\r\n"));
+    shared.ok = createObject(LEDIS_STRING, sdsnew("+OK\r\n"));
+    shared.err = createObject(LEDIS_STRING, sdsnew("-ERR\r\n"));
+    shared.zerobulk = createObject(LEDIS_STRING, sdsnew("0\r\n\r\n"));
+    shared.nil = createObject(LEDIS_STRING, sdsnew("nil\r\n"));
+    shared.zero = createObject(LEDIS_STRING, sdsnew("0\r\n"));
+    shared.one = createObject(LEDIS_STRING, sdsnew("1\r\n"));
+    shared.pong = createObject(LEDIS_STRING, sdsnew("+PONG\r\n"));
 }
 
 /**
@@ -467,6 +485,9 @@ loaderr:{
 }
 }
 
+/**
+ * 清理client的参数，只处理argc和argv字段
+ */ 
 static void freeClientArgv(ledisClient *c){
     for(int i = 0; i < c->argc; i++){
         sdsfree(c->argv[i]);
@@ -494,18 +515,123 @@ static void freeClient(ledisClient *c){
     free(c);
 }
 
+static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask){
+
+    LEDIS_NOTUSED(el);
+    LEDIS_NOTUSED(mask);
+
+    ledisClient *c = privdata;
+    int nwritten = 0, totwritten = 0, objlen;
+    lobj *o;
+    while(listLength(c->reply)){
+        o = listNodeValue(listFirst(c->reply));
+        objlen = sdslen(o->ptr);    //实际字符串长度
+        if(objlen == 0){
+            listDelNode(c->reply, listFirst(c->reply));
+            continue;
+        }
+
+        //开始写入client，分段写入，并没有用到anet.c里面的anetWrite函数
+        nwritten = write(fd, o->ptr + c->sentlen, objlen - c->sentlen);
+        if(nwritten <= 0)   break;
+        c->sentlen += nwritten;
+        totwritten += nwritten;
+        //检查是否写完了，可能因为网络或者client问题，造成部分写入，则进入新的循环再写剩下的（sentlen保存了已写的字节数）
+        if(c->sentlen == objlen){
+            //说明写完一个reply了
+            listDelNode(c->reply, listFirst(c->reply));
+            c->sentlen = 0;
+        }
+    }
+    if(nwritten == -1){
+        if(errno == EAGAIN){
+            nwritten = 0;
+        }else{
+            ledisLog(LEDIS_DEBUG, "Error writing to client: %s", strerror(errno));
+            freeClient(c);
+            return;
+        }
+    }
+    if(totwritten > 0)  c->lastinteraction = time(NULL);
+    if(listLength(c->reply) == 0){
+        c->sentlen = 0;
+        aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+    }
+}
+
 /**
- * 创建需要的常量obj们
+ * 根据传来的命令名称，找在静态命令结构里找特定的命令结构
  */ 
-static void createSharedObjects(void){
-    shared.crlf = createObject(LEDIS_STRING, sdsnew("\r\n"));
-    shared.ok = createObject(LEDIS_STRING, sdsnew("+OK\r\n"));
-    shared.err = createObject(LEDIS_STRING, sdsnew("-ERR\r\n"));
-    shared.zerobulk = createObject(LEDIS_STRING, sdsnew("0\r\n\r\n"));
-    shared.nil = createObject(LEDIS_STRING, sdsnew("nil\r\n"));
-    shared.zero = createObject(LEDIS_STRING, sdsnew("0\r\n"));
-    shared.one = createObject(LEDIS_STRING, sdsnew("1\r\n"));
-    shared.pong = createObject(LEDIS_STRING, sdsnew("+PONG\r\n"));
+static struct ledisCommand *lookupCommand(char *name){
+    int i = 0;
+    while(cmdTable[i].name != NULL){
+        if(!strcmp(name, cmdTable[i].name)){
+            return &cmdTable[i];
+        }
+        i++;
+    }
+    return NULL;
+}
+
+/**
+ * 重置client结构，清理argc,argv以及bulklen字段
+ */ 
+static void resetClient(ledisClient *c){
+    freeClientArgv(c);
+    c->bulklen = -1;
+}
+
+/**
+ * 尝试运行实际命令，可以延迟性处理bulk命令，或者一次性处理inline命令
+ * 返回1说明client还存活，0说明已失联
+ */ 
+static int processCommand(ledisClient *c){
+
+    sdstolower(c->argv[0]);
+
+    if(!strcmp(c->argv[0], "quit")){
+        freeClient(c);
+        return 0;
+    }
+
+    struct ledisCommand *cmd = lookupCommand(c->argv[0]);
+
+    if(!cmd){
+        addReplySds(c, sdsnew("-ERR unknown command\r\n"));
+        resetClient(c);
+        return 1;
+    }else if(cmd->arity != c->argc){
+        addReplySds(c, sdsnew("-ERR wrong number of arguments\r\n"));
+        resetClient(c);
+        return 1;
+    }else if(cmd->type == LEDIS_CMD_BULK && c->bulklen == -1){
+        int bulklen = atoi(c->argv[c->argc-1]); //获取后面bulk数据的长度
+        sdsfree(c->argv[c->argc-1]);    //转成int原来的就没用了
+        if(bulklen < 0 || bulklen > 1024*1024*1024){
+            c->argc--;
+            c->argv[c->argc] = NULL;
+            addReplySds(c, sdsnew("-ERR invalid bulk write count\r\n"));
+            resetClient(c);
+            return 1;
+        }
+        //清理
+        c->argv[c->argc-1] = NULL;
+        c->argc--;
+        c->bulklen = bulklen + 2;   //bulk数据后面还有\r\n要计算，解析时会被跳过
+        //检查querybuf里有没有bulk数据，这个不一定有，没有则要退回readQueryFromClient的again中
+        if(sdslen(c->querybuf) >= c->bulklen){
+            //有则填充最后一个argv，用真正的bulk参数
+            c->argv[c->argc] = sdsnewlen(c->querybuf, c->bulklen - 2);  //bulk实际数据不包括\r\n
+            c->argc++;
+            c->querybuf = sdsrange(c->querybuf, c->bulklen, -1);    //包括bulk数据和\r\n一起跳过
+        }else{
+            return 1;
+        }
+    }
+    //运行命令，可是inline的，也可以是bulk类型的
+    cmd->proc(c);
+    resetClient(c);
+    return 1;
 }
 
 static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask){
@@ -531,7 +657,7 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
         return;
     }
     if(nread){  //总之真读到了数据才继续
-        c->querybuf = sdscatlen(c->querybuf, buf ,nread);   //是往里面追加
+        c->querybuf = sdscatlen(c->querybuf, buf ,nread);   //是往里面追加，所以可能有多组命令
         c->lastinteraction = time(NULL);
     }else{
         return;
@@ -539,20 +665,19 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
 
     //开始处理query缓冲区的数据
 again:
-    if(c->bulklen == -1){
-        //只读取一行字符串
+    if(c->bulklen == -1){   //第一次都会进入这样，不管是inline还是bulk类型
         char *p = strchr(c->querybuf, '\n');
         size_t querylen;
         if(p){
             sds query = c->querybuf;
             c->querybuf = sdsempty();   //直接清空，注意这里querybuf已经指向了全新的结构，可以对query进行free了
-            querylen = 1+(p-(query));   //还得算上换行符
+            querylen = 1+(p-(query));   //即例如set mykey 7\r\n的总长度
             if(sdslen(query) > querylen){
-                //说明c->querybuf有多个换行符（例如pingpong\necho\n），需要保留后面的命令
+                //说明是bulk类型，后面还有实际数据，或者后面有新命令
                 c->querybuf = sdscatlen(c->querybuf, query+querylen, sdslen(query)-querylen);
             }
             //处理querybuf得到的命令（不止1条）
-            *p = '\0';  //直接将第一个\n弄成结束符
+            *p = '\0';  //query弄成set mykey 7\0\0
             if(*(p-1) == '\r'){
                 *(p-1) = '\0';
             }
@@ -578,15 +703,22 @@ again:
                 }
             }
             free(argv); //split调用者还要负责回收
-            //开始执行客户端命令
+            //开始执行客户端命令，如果还有bulk数据或者后面还有新命令，还会回来继续判断
             if(processCommand(c) && sdslen(c->querybuf))    goto again;
         }else if(sdslen(c->querybuf) >= 1024){
             ledisLog(LEDIS_DEBUG, "Client protocol error");
             freeClient(c);
             return;
         }
-    }else{  //处理块数据
-        int qbl = sdslen(c->querybuf);
+    }else{  //如果bulk数据不是一起来的，在下一次才来，就会进入这里直接处理
+        int qbl = sdslen(c->querybuf);  
+        if(c->bulklen <= qbl){  //querybuf里面的实际数据长度，至少要大于上次bulklen才对
+            c->argv[c->argc] = sdsnewlen(c->querybuf, c->bulklen - 2);  //填充bulk数据
+            c->argc++;
+            c->querybuf = sdsrange(c->querybuf, c->bulklen, -1);
+            processCommand(c);
+            return;
+        }
     }
 }
 
@@ -625,6 +757,22 @@ static int createClient(int fd){
     //添加到server.clients的尾部
     if(!listAddNodeTail(server.clients, c)) oom("listAddNodeTail");
     return LEDIS_OK;
+}
+
+static void addReply(ledisClient *c, lobj *obj){
+    if(listLength(c->reply) == 0 && 
+        aeCreateFileEvent(server.el, c->fd, AE_WRITABLE, 
+        sendReplyToClient, c, NULL) == AE_ERR){
+        return;
+    }
+    if(!listAddNodeTail(c->reply, obj)) oom("listAddNodeTail");
+    incrRefCount(obj);  //引用数+1,因为又跑到c->reply里面了
+}
+
+static void addReplySds(ledisClient *c, sds s){
+    lobj *o = createObject(LEDIS_STRING, s);
+    addReply(c, o);
+    decrRefCount(o);    //引用数-1,应该还剩1,通过c->reply来指向
 }
 
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
@@ -732,6 +880,17 @@ static void freeSetObject(lobj *o){
     //什么也不做，此版本没有set这个类型
     o = o;
 }
+
+/*====================================== 各种命令实现 ===============================*/
+
+static void echoCommand(ledisClient *c){
+    addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(c->argv[1])));
+    addReplySds(c, c->argv[1]);
+    addReply(c, shared.crlf);
+    c->argv[1] = NULL;
+}
+
+/*====================================== 主函数 ===============================*/
 
 int main(int argc, char *argv[]){
 

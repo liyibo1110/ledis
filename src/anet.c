@@ -98,8 +98,6 @@ int anetSetSendBuffer(char *err, int fd, int bufferSize){
     return ANET_OK;
 }
 
-int anetSetSendBuffer(char *err, int fd, int bufferSize)
-
 /**
  * 连接给定的addr和port端口，用的是新版的API重写，而不是redis自己默认的老版本
  */ 
@@ -293,9 +291,9 @@ int anetResolve(char *err, char *host, char *ipbuf){
     
 }
 
-int main(int argc, char *argv[]){
+ //int main(int argc, char *argv[]){
 
-    char err[ANET_ERR_LEN];
+    //char err[ANET_ERR_LEN];
 
     //测试anetResolve函数
     /* printf("test anetResolve function\n");
@@ -317,7 +315,11 @@ int main(int argc, char *argv[]){
     printf("test anetTcpAccpet ok, cfd=%d, clientIp=%s, clientPort=%d\n", cfd, host, port);  */
 
     //测试anetTcpConnect函数
-    printf("test anetTcpConnect...\n");
+    /* printf("test anetTcpConnect...\n");
     int sfd2 = anetTcpConnect(err, "127.0.0.1", 33389);
-    printf("test anetTcpConnect ok, sfd2=%d\n", sfd2); 
-}
+    printf("test anetTcpConnect ok, sfd2=%d\n", sfd2);  */
+
+    /* char *str = "myvalue";
+    int i = atoi(str);
+    printf("i=%d\n", i); */
+//} 
