@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include <time.h>
 
 #include <arpa/inet.h>
+#include <netdb.h>
 
 #include <signal.h>
 #include <sys/wait.h>
@@ -147,11 +149,13 @@ static void addReply(ledisClient *c, lobj *obj);
 static void addReplySds(ledisClient *c, sds s);
 
 //所有函数均只在本文件被调用
+static void pingCommand(ledisClient *c);
 static void echoCommand(ledisClient *c);
 
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
+    {"ping",pingCommand,1,LEDIS_CMD_INLINE},
     {"echo",echoCommand,2,LEDIS_CMD_BULK},
     {"",NULL,0,0}
 };
@@ -372,6 +376,7 @@ static void initServer(){
         ledisLog(LEDIS_WARNING, "Opening TCP port: %s", server.neterr);
         exit(EXIT_FAILURE);
     }
+    printf("server.fd=%d\n", server.fd);
     //继续给dict数组内部真实分配
     for(int i = 0; i < server.dbnum; i++){
         server.dict[i] = dictCreate(&sdsDictType, NULL);
@@ -533,6 +538,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
 
         //开始写入client，分段写入，并没有用到anet.c里面的anetWrite函数
         nwritten = write(fd, o->ptr + c->sentlen, objlen - c->sentlen);
+        printf("nwritten=%d\n", nwritten);
         if(nwritten <= 0)   break;
         c->sentlen += nwritten;
         totwritten += nwritten;
@@ -542,6 +548,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
             listDelNode(c->reply, listFirst(c->reply));
             c->sentlen = 0;
         }
+        printf("reply over.\n");
     }
     if(nwritten == -1){
         if(errno == EAGAIN){
@@ -619,7 +626,7 @@ static int processCommand(ledisClient *c){
         c->argc--;
         c->bulklen = bulklen + 2;   //bulk数据后面还有\r\n要计算，解析时会被跳过
         //检查querybuf里有没有bulk数据，这个不一定有，没有则要退回readQueryFromClient的again中
-        if(sdslen(c->querybuf) >= c->bulklen){
+        if((signed)sdslen(c->querybuf) >= c->bulklen){
             //有则填充最后一个argv，用真正的bulk参数
             c->argv[c->argc] = sdsnewlen(c->querybuf, c->bulklen - 2);  //bulk实际数据不包括\r\n
             c->argc++;
@@ -638,11 +645,12 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
     //此版本只需要使用fd和privdata
     LEDIS_NOTUSED(el);
     LEDIS_NOTUSED(mask);
-
+    printf("readQueryFromClient\n");
     ledisClient *c = (ledisClient *)privdata;
     char buf[LEDIS_QUERYBUF_LEN];
 
     int nread = read(fd, buf, LEDIS_QUERYBUF_LEN);
+    printf("nread=%d\n", nread);
     if(nread == -1){
         if(errno == EAGAIN){
             nread = 0;
@@ -658,6 +666,7 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
     }
     if(nread){  //总之真读到了数据才继续
         c->querybuf = sdscatlen(c->querybuf, buf ,nread);   //是往里面追加，所以可能有多组命令
+        printf("%s", c->querybuf);
         c->lastinteraction = time(NULL);
     }else{
         return;
@@ -782,10 +791,11 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
     LEDIS_NOTUSED(mask);
     LEDIS_NOTUSED(privdata);
 
-    char cip[128];  //写死的，不太好
+    char cip[1025];  //写死的，不太好
     int cport;
-
+    printf("sdf=%d\n", fd);
     int cfd = anetAccept(server.neterr, fd, cip, &cport);
+    printf("cdf=%d\n", cfd);
     if(cfd == AE_ERR){
         ledisLog(LEDIS_DEBUG, "Accepting client connection: %s", server.neterr);
         return;
@@ -798,6 +808,7 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
         close(cfd); //状态此时不一定
         return;
     }
+    printf("createClient is ok!\n");
 }
 
 /*========================= ledis对象相关实现 ===============================*/
@@ -882,6 +893,10 @@ static void freeSetObject(lobj *o){
 }
 
 /*====================================== 各种命令实现 ===============================*/
+
+static void pingCommand(ledisClient *c){
+    addReply(c, shared.pong);
+}
 
 static void echoCommand(ledisClient *c){
     addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(c->argv[1])));

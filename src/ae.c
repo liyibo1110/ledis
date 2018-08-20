@@ -194,18 +194,31 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
     if(flags & AE_FILE_EVENTS){
         //尝试遍历并根据mask，加入相应的监控列表
         while(fe != NULL){
-            if(fe->mask & AE_READABLE)  FD_SET(fe->fd, &rfds);
-            if(fe->mask & AE_WRITABLE)  FD_SET(fe->fd, &wfds);
-            if(fe->mask & AE_EXCEPTION)  FD_SET(fe->fd, &efds);
+            if(fe->mask & AE_READABLE)  {
+                printf("fd: %d has put rfds\n", fe->fd);
+                FD_SET(fe->fd, &rfds);
+            }
+            if(fe->mask & AE_WRITABLE)  {
+                printf("fd: %d has put wfds\n", fe->fd);
+                FD_SET(fe->fd, &wfds);
+            }
+            if(fe->mask & AE_EXCEPTION) {
+                printf("fd: %d has put efds\n", fe->fd);
+                FD_SET(fe->fd, &efds);
+            }
             //寻找最大的fd，为了满足select
             if(maxfd < fe->fd)  maxfd = fe->fd;
             numfd++;
+            //printf("maxfd=%d\n", maxfd);
             fe = fe->next;
         }
     }
 
     
     if(numfd || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))){
+
+        //printf("numfd=%d\n", numfd);
+
         //尝试找出最近要到达的1个timeEvent
         aeTimeEvent *shortest = NULL;
         struct timeval tv, *tvp;
@@ -234,8 +247,10 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
             }
         }
 
-        int retval = select(maxfd, &rfds, &wfds, &efds, tvp);
+        int retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
+        //printf("select is over, retval=%d\n", retval);
         if(retval > 0){
+
             //还得遍历event集合，找出哪些就绪了
             fe = eventLoop->fileEventHead;
             while(fe != NULL){
@@ -249,7 +264,9 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
                     if(fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds))   mask |= AE_WRITABLE;
                     if(fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds))   mask |= AE_EXCEPTION;
                     //执行相应的处理函数
+                    printf("run fileProc\n");
                     fe->fileProc(eventLoop, fe->fd, fe->clientData, mask);
+                    printf("run fileProc over\n");
                     processed++;
                     //如果处理过里面的event，整个eventLoop可能会有变化，所以需要重头再次遍历
                     fe = eventLoop->fileEventHead;
@@ -294,6 +311,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
             }
         }
     }
+    printf("processed=%d\n", processed);
     return processed;   //本次一共处理了多少个fileEvent
 }
 

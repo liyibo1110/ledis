@@ -4,26 +4,32 @@
 #include <unistd.h>
 #include "anet.h"
 
+void pingCommandTest(char *err, int sfd){
+
+    char *data = "ping\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    int result = read(sfd, res, 1024);
+    printf("ping command resultLength: %d\n", result);
+    printf("ping command result: %s", res);
+}
+
 void echoCommandTest(char *err, int sfd){
 
     char *msg = "hello!";
     char data[1024];
     char res[1024];
-    sprintf(data, "echo %d\r\n%s", (int)strlen(msg), msg);
+    sprintf(data, "echo %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("echo command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
 
-    printf("sfd=%d\n", sfd);
-    printf("msg=%s\n", msg);
-    printf("data=%s\n", data);
-
-    int result1 = write(sfd, data, (int)strlen(data));
-
-    printf("write1 ok, result1=%d\n", result1);
-
-    int result2 = write(sfd, "\r\n", 2);
-    printf("write2 ok, result2=%d\n", result2);
     //开始读
-    int result3 = read(sfd, res, 1024);
-    printf("result3: %s\n", res);
+    int result = read(sfd, res, 1024);
+    printf("echo command resultLength: %d\n", result);
+    printf("echo command result: %s", res);
 }
 
 int main(int argc, char *argv[]){
@@ -35,8 +41,12 @@ int main(int argc, char *argv[]){
         exit(EXIT_FAILURE);
     }
 
+    //测试ping命令
+    pingCommandTest(err, sfd);
     //测试echo命令
     echoCommandTest(err, sfd);
+
+    //sleep(3600);
 
     exit(EXIT_SUCCESS);
 }

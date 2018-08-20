@@ -174,4 +174,5 @@ listNode *listIndex(list *list, int index){
         node = list->head;
         while(index-- && node) node = node->next;
     }
+    return node;
 }

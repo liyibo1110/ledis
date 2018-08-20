@@ -50,10 +50,10 @@ int anetWrite(int fd, void *buf, int count){
     int numWritten;
     int totalWritten = 0;
     while(totalWritten != count){
-        numWritten = write(fd, buf, count - numWritten);
+        numWritten = write(fd, buf, count - totalWritten);
         if(numWritten == 0) return totalWritten;
         if(numWritten == -1)    return -1;
-        totalWritten += totalWritten;
+        totalWritten += numWritten;
         buf += numWritten;
     }
     return totalWritten;

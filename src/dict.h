@@ -17,8 +17,8 @@ typedef struct dictType{
     void *(*keyDup)(void *privdata, const void *key);
     void *(*valDup)(void *privdata, const void *obj);
     int (*keyCompare)(void *privdata, const void *key1, const void *key2);
-    void (*keyDestructor)(void *privdata, const void *key);
-    void (*valDestructor)(void *privdata, const void *obj);
+    void (*keyDestructor)(void *privdata, void *key);
+    void (*valDestructor)(void *privdata, void *obj);
 } dictType;
 
 typedef struct dict{

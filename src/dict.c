@@ -115,7 +115,7 @@ int dictExpand(dict *ht, unsigned int size){
     memset(n.table, 0, realsize*sizeof(dictEntry*));
     n.used = ht->used;
     //开始rehash
-    for(int i = 0; i < ht->size && ht->used > 0; i++){
+    for(unsigned int i = 0; i < ht->size && ht->used > 0; i++){
         if(ht->table[i] == NULL) continue;
         //处理单个桶
         dictEntry *he = ht->table[i];
@@ -199,7 +199,7 @@ int dictDeleteNoFree(dict *ht, void *key){
  * 清理ht里面的所有数据，但不是删除ht本身
  */ 
 int _dictClear(dict *ht){
-    for(int i = 0; i > ht->size && ht->used > 0; i++){
+    for(unsigned int i = 0; i > ht->size && ht->used > 0; i++){
         dictEntry *he = ht->table[i];
         if(he == NULL) continue;    //空桶
         dictEntry *nextHe;
@@ -398,12 +398,12 @@ static int _dictStringCopyHTKeyCompare(void *privdata, const void *key1, const v
     return strcmp(key1, key2) == 0;
 }
 
-static void _dictStringCopyHTKeyDestructor(void *privdata, const void *key){
+static void _dictStringCopyHTKeyDestructor(void *privdata, void *key){
     DICT_NOTUSED(privdata); //压根就没用上
     _dictFree((void *)key); //入参是const类型
 }
 
-static void _dictStringKeyValCopyHTValDestructor(void *privdata, const void *val){
+static void _dictStringKeyValCopyHTValDestructor(void *privdata, void *val){
     DICT_NOTUSED(privdata); //压根就没用上
     _dictFree((void *)val); //入参是const类型
 }

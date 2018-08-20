@@ -83,7 +83,7 @@ static sds sdsMakeRoomFor(sds s, size_t addlen){
     size_t newlen = (len + addlen) * 2; //扩展后为2倍空间
     struct sdshdr *newsh = realloc(sh, sizeof(struct sdshdr) + newlen + 1);
     #ifdef SDS_ABORT_ON_OOM
-        if(newsh == NULL) sdsOomAbort()
+        if(newsh == NULL) sdsOomAbort();
     #else
         if(newsh == NULL) return NULL;
     #endif
