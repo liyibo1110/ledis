@@ -151,12 +151,24 @@ static void addReplySds(ledisClient *c, sds s);
 //所有函数均只在本文件被调用
 static void pingCommand(ledisClient *c);
 static void echoCommand(ledisClient *c);
+static void dbsizeCommand(ledisClient *c);
 
+static void setCommand(ledisClient *c);
+static void setnxCommand(ledisClient *c);
+static void getCommand(ledisClient *c);
+static void delCommand(ledisClient *c);
+static void existsCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
     {"ping",pingCommand,1,LEDIS_CMD_INLINE},
     {"echo",echoCommand,2,LEDIS_CMD_BULK},
+    {"dbsize",dbsizeCommand,1,LEDIS_CMD_INLINE},
+    {"set",setCommand,3,LEDIS_CMD_BULK},
+    {"setnx",setnxCommand,3,LEDIS_CMD_BULK},
+    {"get",getCommand,2,LEDIS_CMD_INLINE},
+    {"del",delCommand,2,LEDIS_CMD_INLINE},
+    {"exists",existsCommand,2,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -905,6 +917,106 @@ static void echoCommand(ledisClient *c){
     c->argv[1] = NULL;
 }
 
+static void dbsizeCommand(ledisClient *c){
+    addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", dictGetHashTableUsed(c->dict)));
+}
+
+static void setGenericCommand(ledisClient *c, int nx){
+    lobj *o = createObject(LEDIS_STRING, c->argv[2]);
+    c->argv[2] = NULL;
+    int retval = dictAdd(c->dict, c->argv[1], o);
+    if(retval == DICT_ERR){
+        if(!nx){    //如果是setCommand，直接覆盖原来的val
+            dictReplace(c->dict, c->argv[1], o); 
+        }else{  //如果是setnxCommand，则撤销val
+            decrRefCount(o);
+        }
+    }else{
+        //到这里面说明dictAdd成功了，把原始置空就可以了
+        c->argv[1] = NULL;
+    }
+    server.dirty++;
+    addReply(c, shared.ok);
+}
+
+static void setCommand(ledisClient *c){
+    setGenericCommand(c, 0);
+}
+
+static void setnxCommand(ledisClient *c){
+    setGenericCommand(c, 1);
+}
+
+static void getCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.nil);
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type != LEDIS_STRING){
+            char *err = "GET against key not holding a string value";
+            //err是局部的，但sdscatprintf会去复制字符串
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+        }else{
+            //正常情况
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(o->ptr)));
+            addReply(c, o);
+            addReply(c, shared.crlf);
+        }
+    }
+}
+
+static void delCommand(ledisClient *c){
+    
+    if(dictDelete(c->dict, c->argv[1]) == DICT_OK){
+        server.dirty++;
+    }
+    addReply(c, shared.ok);
+}
+
+static void existsCommand(ledisClient *c){
+    
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+    }else{
+        addReply(c, shared.one);
+    }
+}
+
+static void incrDecrCommand(ledisClient *c, int incr){
+    
+    long long value;
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        value = 0;  //没有key则将val为0
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_STRING){
+            //如果原来的val是字符串，强制转成ll
+            char *endp;
+            value = strtoll(o->ptr, endp, 10);
+        }else{
+            value = 0;  //val不是sds，强制改成0，而不是返回错误之类的
+        }
+    }
+
+    value += incr;//自增或者自减
+    sds newval = sdscatprintf(sdsempty, "%lld", value);
+    lobj *obj = createObject(LEDIS_STRING, newval);
+    //放冰箱里
+    if(dictAdd(c->dict, c->argv[1], obj) == DICT_OK){
+        //如果ok，argv[1]里面的key已经被dict的结构指向了，所以最好干掉argv[1]的指向，以防被free
+        c->argv[1] = NULL;
+    }else{
+        //如果存在key，则直接替换
+        dictReplace(c->dict, c->argv[1], obj);
+    }
+    server.dirty++; //无论如何都会改变
+    addReply(c, obj);
+    addReply(c, shared.crlf);
+}
+
 /*====================================== 主函数 ===============================*/
 
 int main(int argc, char *argv[]){
@@ -923,6 +1035,9 @@ int main(int argc, char *argv[]){
     }
     ledisLog(LEDIS_NOTICE, "Server started");
     //尝试恢复数据库dump.ldb文件，暂不开发
+
+    //假定恢复db用了5s
+    //sleep(5);
 
     //基于server的fd，创建fileEvent
     if(aeCreateFileEvent(server.el, server.fd, AE_READABLE,

@@ -3,10 +3,12 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <string.h>
 #include <stdbool.h>
 #include <sys/time.h>
 #include <time.h>
 #include <sys/select.h>
+#include <errno.h>
 
 /**
  * 新建并初始化一个EventLoop，都没有值
@@ -223,12 +225,13 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
         aeTimeEvent *shortest = NULL;
         struct timeval tv, *tvp;
         if(flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT)){
-            shortest = aeSearchNearestTimer(eventLoop);
+            shortest = aeSearchNearestTimer(eventLoop); //有可能在这里就已经超时，select会返回-1
         }
         if(shortest){   //计算出与当前的时间差并保存
             long now_sec, now_ms;
             aeGetTime(&now_sec, &now_ms);
             tvp = &tv;
+            //printf("tvp->tv_sec=%ld\n", (long)shortest->when_sec - now_sec);
             tvp->tv_sec = shortest->when_sec - now_sec;
             //处理毫秒差，要考虑秒退位的问题，还要注意timeval结构里面存的是微秒
             if(shortest->when_ms < now_ms){
@@ -247,8 +250,9 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
             }
         }
 
+        //tvp时间有可能是负数（例如第一次启动在loadDb操作花费了超过1s的时间），这样retval会为-1,程序并没有处理错误，而是继续
         int retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
-        //printf("select is over, retval=%d\n", retval);
+        printf("select is over, retval=%d\n", retval);
         if(retval > 0){
 
             //还得遍历event集合，找出哪些就绪了
@@ -264,9 +268,9 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
                     if(fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds))   mask |= AE_WRITABLE;
                     if(fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds))   mask |= AE_EXCEPTION;
                     //执行相应的处理函数
-                    printf("run fileProc\n");
+                    //printf("run fileProc\n");
                     fe->fileProc(eventLoop, fe->fd, fe->clientData, mask);
-                    printf("run fileProc over\n");
+                    //printf("run fileProc over\n");
                     processed++;
                     //如果处理过里面的event，整个eventLoop可能会有变化，所以需要重头再次遍历
                     fe = eventLoop->fileEventHead;
