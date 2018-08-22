@@ -33,18 +33,7 @@ void echoCommandTest(char *err, int sfd){
     printf("echo command result: %s\n", res);
 }
 
-void dbsizeCommandTest(char *err, int sfd){
 
-    char *data = "dbsize\r\n";
-    anetWrite(sfd, data, (int)strlen(data));
-    
-    //开始读
-    char res[1024];
-    memset(res, 0, 1024);
-    int result = read(sfd, res, 1024);
-    printf("dbsize command resultLength: %d\n", result);
-    printf("dbsize command result: %s", res);
-}
 
 void setCommandTest(char *err, int sfd){
     
@@ -106,6 +95,71 @@ void existsCommandTest(char *err, int sfd){
     printf("exists command result: %s\n", res);
 }
 
+void incrCommandTest(char *err, int sfd){
+    
+    char *data = "incr mykey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("incr command resultLength: %d\n", result);
+    printf("incr command result: %s\n", res);
+}
+
+void decrCommandTest(char *err, int sfd){
+    
+    char *data = "decr mykey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("decr command resultLength: %d\n", result);
+    printf("decr command result: %s\n", res);
+}
+
+void dbsizeCommandTest(char *err, int sfd){
+
+    char *data = "dbsize\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("dbsize command resultLength: %d\n", result);
+    printf("dbsize command result: %s\n", res);
+}
+
+void randomKeyCommandTest(char *err, int sfd){
+    
+    char *data = "randomKey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("randomKey command resultLength: %d\n", result);
+    printf("randomKey command result: %s\n", res);
+}
+
+void lastsaveCommandTest(char *err, int sfd){
+    
+    char *data = "lastsave\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("lastsave command resultLength: %d\n", result);
+    printf("lastsave command result: %s\n", res);
+}
+
 void delCommandTest(char *err, int sfd){
     
     char *data = "del mykey\r\n";
@@ -117,6 +171,25 @@ void delCommandTest(char *err, int sfd){
     int result = read(sfd, res, 1024);
     printf("del command resultLength: %d\n", result);
     printf("del command result: %s\n", res);
+}
+
+void selectCommandTest(char *err, int sfd){
+    
+    char *data = "select 1\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("select command resultLength: %d\n", result);
+    printf("select command result: %s\n", res);
+}
+
+void shutdownCommandTest(char *err, int sfd){
+    
+    char *data = "shutdown\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
 }
 
 int main(int argc, char *argv[]){
@@ -133,7 +206,7 @@ int main(int argc, char *argv[]){
     //测试echo命令
     //echoCommandTest(err, sfd);
     //测试dbsize命令
-    //dbsizeCommandTest(err, sfd);
+    dbsizeCommandTest(err, sfd);
     //测试set命令
     setCommandTest(err, sfd);
     //测试setnx命令
@@ -142,8 +215,20 @@ int main(int argc, char *argv[]){
     getCommandTest(err, sfd);
     //测试exists命令
     existsCommandTest(err, sfd);
+    //测试incr命令
+    incrCommandTest(err, sfd);
+    //测试decr命令
+    decrCommandTest(err, sfd);
+    //测试randomKey命令
+    randomKeyCommandTest(err, sfd);
+    //测试lastsave命令
+    lastsaveCommandTest(err, sfd);
+    //测试shutdown命令
+    shutdownCommandTest(err, sfd);
     //测试del命令
-    delCommandTest(err, sfd);
+    //delCommandTest(err, sfd);
+    //测试select命令
+    //selectCommandTest(err, sfd);
     //sleep(3600);
 
     exit(EXIT_SUCCESS);

@@ -158,6 +158,12 @@ static void setnxCommand(ledisClient *c);
 static void getCommand(ledisClient *c);
 static void delCommand(ledisClient *c);
 static void existsCommand(ledisClient *c);
+static void incrCommand(ledisClient *c);
+static void decrCommand(ledisClient *c);
+static void selectCommand(ledisClient *c);
+static void randomKeyCommand(ledisClient *c);
+static void lastsaveCommand(ledisClient *c);
+static void shutdownCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -169,6 +175,12 @@ static struct ledisCommand cmdTable[] = {
     {"get",getCommand,2,LEDIS_CMD_INLINE},
     {"del",delCommand,2,LEDIS_CMD_INLINE},
     {"exists",existsCommand,2,LEDIS_CMD_INLINE},
+    {"incr",incrCommand,2,LEDIS_CMD_INLINE},
+    {"decr",decrCommand,2,LEDIS_CMD_INLINE},
+    {"select",selectCommand,2,LEDIS_CMD_INLINE},
+    {"randomKey",randomKeyCommand,1,LEDIS_CMD_INLINE},
+    {"lastsave",lastsaveCommand,1,LEDIS_CMD_INLINE},
+    {"shutdown",shutdownCommand,1,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -606,7 +618,7 @@ static void resetClient(ledisClient *c){
  */ 
 static int processCommand(ledisClient *c){
 
-    sdstolower(c->argv[0]);
+    //sdstolower(c->argv[0]);
 
     if(!strcmp(c->argv[0], "quit")){
         freeClient(c);
@@ -995,14 +1007,14 @@ static void incrDecrCommand(ledisClient *c, int incr){
         if(o->type == LEDIS_STRING){
             //如果原来的val是字符串，强制转成ll
             char *endp;
-            value = strtoll(o->ptr, endp, 10);
+            value = strtoll(o->ptr, &endp, 10);
         }else{
             value = 0;  //val不是sds，强制改成0，而不是返回错误之类的
         }
     }
 
     value += incr;//自增或者自减
-    sds newval = sdscatprintf(sdsempty, "%lld", value);
+    sds newval = sdscatprintf(sdsempty(), "%lld", value);
     lobj *obj = createObject(LEDIS_STRING, newval);
     //放冰箱里
     if(dictAdd(c->dict, c->argv[1], obj) == DICT_OK){
@@ -1015,6 +1027,45 @@ static void incrDecrCommand(ledisClient *c, int incr){
     server.dirty++; //无论如何都会改变
     addReply(c, obj);
     addReply(c, shared.crlf);
+}
+
+static void incrCommand(ledisClient *c){
+    incrDecrCommand(c, 1);
+}
+
+static void decrCommand(ledisClient *c){
+    incrDecrCommand(c, -1);
+}
+
+static void selectCommand(ledisClient *c){
+    int id = atoi(c->argv[1]);
+    if(selectDb(c, id) == LEDIS_OK){
+        addReply(c, shared.ok);
+    }else{
+        addReplySds(c, sdsnew("-ERR invalid DB index\r\n"));    //原版直接返回C字符串，可能有问题，只有sds才能使用sds相关函数
+    }
+}
+
+static void randomKeyCommand(ledisClient *c){
+    
+    dictEntry *de = dictGetRandomKey(c->dict);
+    if(de){
+        lobj *o = dictGetEntryVal(de);
+        addReply(c, o);
+        addReply(c, shared.crlf);
+    }else{
+        addReply(c, shared.crlf);
+    }
+}
+
+static void lastsaveCommand(ledisClient *c){
+    addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", server.lastsave));
+}
+
+static void shutdownCommand(ledisClient *c){
+    //暂时没有save
+    ledisLog(LEDIS_NOTICE, "server exit now, bye bye...");
+    exit(EXIT_SUCCESS);
 }
 
 /*====================================== 主函数 ===============================*/
