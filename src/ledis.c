@@ -156,6 +156,7 @@ static void dbsizeCommand(ledisClient *c);
 static void setCommand(ledisClient *c);
 static void setnxCommand(ledisClient *c);
 static void getCommand(ledisClient *c);
+static void keysCommand(ledisClient *c);
 static void delCommand(ledisClient *c);
 static void existsCommand(ledisClient *c);
 static void incrCommand(ledisClient *c);
@@ -164,6 +165,13 @@ static void selectCommand(ledisClient *c);
 static void randomKeyCommand(ledisClient *c);
 static void lastsaveCommand(ledisClient *c);
 static void shutdownCommand(ledisClient *c);
+
+static void renameCommand(ledisClient *c);
+static void renamenxCommand(ledisClient *c);
+static void moveCommand(ledisClient *c);
+
+static void lpushCommand(ledisClient *c);
+static void rpushCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -173,6 +181,7 @@ static struct ledisCommand cmdTable[] = {
     {"set",setCommand,3,LEDIS_CMD_BULK},
     {"setnx",setnxCommand,3,LEDIS_CMD_BULK},
     {"get",getCommand,2,LEDIS_CMD_INLINE},
+    {"keys",keysCommand,2,LEDIS_CMD_INLINE},
     {"del",delCommand,2,LEDIS_CMD_INLINE},
     {"exists",existsCommand,2,LEDIS_CMD_INLINE},
     {"incr",incrCommand,2,LEDIS_CMD_INLINE},
@@ -181,10 +190,153 @@ static struct ledisCommand cmdTable[] = {
     {"randomKey",randomKeyCommand,1,LEDIS_CMD_INLINE},
     {"lastsave",lastsaveCommand,1,LEDIS_CMD_INLINE},
     {"shutdown",shutdownCommand,1,LEDIS_CMD_INLINE},
+    {"rename",renameCommand,3,LEDIS_CMD_INLINE},
+    {"renamenx",renamenxCommand,3,LEDIS_CMD_INLINE},
+    {"move",moveCommand,3,LEDIS_CMD_INLINE},
+    {"lpush",lpushCommand,3,LEDIS_CMD_BULK},
+    {"rpush",rpushCommand,3,LEDIS_CMD_BULK},
     {"",NULL,0,0}
 };
 
 /*====================================== 工具函数 ===============================*/
+
+/**
+ * 匹配字符串，是否符合给定pattern的模式，就是个简化版正则的解析器
+ * 返回1表示匹配，0则不匹配
+ */ 
+int stringmatchlen(const char *pattern, int patternLen,
+            const char *string, int stringLen, int nocase){
+
+    while(patternLen){
+        switch(pattern[0]){
+            case '*':{  //先处理通配符*
+                while(pattern[1] == '*'){   //如果后面还是*，则自己算命中，直到不是*
+                    pattern++;
+                    patternLen--;
+                }
+                if(patternLen == 1) return 1;   //说明pattern全是一堆*
+                while(stringLen){
+                    //递归调用后面的，已经去掉了之前的*，内部只比后面的内容（后面可能还会有*）
+                    if(stringmatchlen(pattern+1, patternLen-1, string, stringLen, nocase)){
+                        return 1;  
+                    }
+                    //如果剩下的pattern不匹配，则从头开始减少string，例如mykey,ykey,key,ey,y这样的
+                    string++;
+                    stringLen--;
+                }
+                //string缩没了也没有递归匹配，就是匹配不到
+                return 0; 
+                break;
+            }
+            case '?':{  //处理单个通配符
+                if(stringLen == 0)  return 0;   //string没内容
+                //string直接放过
+                string++;
+                stringLen--;
+                break;
+            }
+            case '[':{  //处理最复杂的或者关系（包括^）
+                pattern++;
+                patternLen--;   //跳过[，进来了就没意义了
+                int not = pattern[0] == '^';
+                if(not){    //存储了^标记，再次跳过
+                    pattern++;  
+                    patternLen--;
+                }
+                int match = 0;
+                while(true){    //逐一处理[后面的部分
+                    if(pattern[0] == '\\'){
+                        pattern++;
+                        patternLen--;   //还得跳
+                        if(pattern[0] == string[0]){
+                            match = 1;
+                        }
+                    }else if(pattern[0] == ']'){
+                        break;
+                    }else if(patternLen == 0){  //如果压根没有]闭合，match返回0，还要回退1格
+                        pattern--;
+                        patternLen++;
+                        break;
+                    }else if(pattern[1] == '-' && patternLen >= 3){ //还支持a-z这样的匹配
+                        int start = pattern[0];
+                        int end = pattern[2];
+                        int c = string[0];
+                        if(start > end){    //如果是z-a，则交换顺序
+                            int t = start;
+                            start = end;
+                            end = t;
+                        }
+                        if(nocase){
+                            start = tolower(start);
+                            end = tolower(end);
+                            c = tolower(c);
+                        }
+                        pattern += 2;
+                        patternLen -= 2;
+                        if(c >= start && c <= end){
+                            match = 1;
+                        }
+                    }else{  //普通字符
+                        if(nocase){
+                            if(tolower((int)pattern[0]) == tolower((int)string[0])){
+                                match = 1;
+                            }
+                        }else{
+                            if(pattern[0] == string[0]){
+                                match = 1;
+                            }
+                        }
+                    }
+                    pattern++;
+                    patternLen--;
+                }
+                if(not){
+                    match = !match; //取反
+                }
+                if(!match)  return 0;
+                //到这里说明匹配到了
+                string++;
+                stringLen--;
+                break;
+            }
+            case '\\':{ //处理转义符
+                if(patternLen >= 2){    //后面还有，则跳过转义符，继续default，不要break
+                    pattern++;
+                    patternLen--;
+                }
+            }
+            default:{   //普通字符了
+                if(nocase){
+                    if(tolower((int)pattern[0]) != tolower((int)string[0])){
+                        return 0;
+                    }
+                }else{
+                    if(pattern[0] != string[0]){
+                        return 0;
+                    }
+                }
+                //中了
+                string++;
+                stringLen--;
+                break;
+            }
+        }
+        pattern++;
+        patternLen--;
+        if(stringLen == 0){ //如果字符串都匹配到了，pattern还有剩余，吃了最后所有都是*的情况
+            while(*pattern == '*'){ 
+                pattern++;
+                patternLen--;
+            }
+            break;
+        }
+    }
+    //都匹配完了，看最后结果
+    if(patternLen == 0 && stringLen == 0){  //pattern和string都消耗完了说明就匹配到了
+        return 1;
+    }
+    return 0;
+}
 
 void ledisLog(int level, const char *fmt, ...){
     va_list ap;
@@ -926,6 +1078,7 @@ static void echoCommand(ledisClient *c){
     addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(c->argv[1])));
     addReplySds(c, c->argv[1]);
     addReply(c, shared.crlf);
+    //已经被reply内部指向，要变成裸指针，防止被free
     c->argv[1] = NULL;
 }
 
@@ -944,7 +1097,7 @@ static void setGenericCommand(ledisClient *c, int nx){
             decrRefCount(o);
         }
     }else{
-        //到这里面说明dictAdd成功了，把原始置空就可以了
+        //已经被dict内部指向，要变成裸指针，防止被free
         c->argv[1] = NULL;
     }
     server.dirty++;
@@ -1018,7 +1171,7 @@ static void incrDecrCommand(ledisClient *c, int incr){
     lobj *obj = createObject(LEDIS_STRING, newval);
     //放冰箱里
     if(dictAdd(c->dict, c->argv[1], obj) == DICT_OK){
-        //如果ok，argv[1]里面的key已经被dict的结构指向了，所以最好干掉argv[1]的指向，以防被free
+        //已经被dict内部指向，要变成裸指针，防止被free
         c->argv[1] = NULL;
     }else{
         //如果存在key，则直接替换
@@ -1058,6 +1211,32 @@ static void randomKeyCommand(ledisClient *c){
     }
 }
 
+static void keysCommand(ledisClient *c){
+    sds pattern = c->argv[1];
+    int plen = sdslen(c->argv[1]);
+    dictIterator *di = dictGetIterator(c->dict);
+    sds keys = sdsempty();
+
+    //遍历dict，寻找匹配的key
+    dictEntry *de;
+    while((de = dictNext(di)) != NULL){
+        sds key = dictGetEntryKey(de);
+        if((pattern[0] == '*' && pattern[1] == '\0') || 
+            stringmatchlen(pattern, plen, key, sdslen(key), 0)){
+            //匹配则加入结果字符串中，并用空格分隔
+            keys = sdscatlen(keys, key, sdslen(key));
+            keys = sdscatlen(keys, " ", 1);
+        }
+    }
+    dictReleaseIterator(di);
+    keys = sdstrim(keys, " ");  //trim
+    sds reply = sdscatprintf(sdsempty(), "%lu\r\n", sdslen(keys));
+    reply = sdscatlen(reply, keys, sdslen(keys));
+    reply = sdscatlen(reply, "\r\n", 2);
+    sdsfree(keys);  //必须
+    addReplySds(c, reply);
+}
+
 static void lastsaveCommand(ledisClient *c){
     addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", server.lastsave));
 }
@@ -1066,6 +1245,117 @@ static void shutdownCommand(ledisClient *c){
     //暂时没有save
     ledisLog(LEDIS_NOTICE, "server exit now, bye bye...");
     exit(EXIT_SUCCESS);
+}
+
+static void renameGenericCommand(ledisClient *c, int nx){
+    
+    //新旧key不能一样
+    if(sdscmp(c->argv[1], c->argv[2]) == 0){
+        ledisLog(LEDIS_WARNING, "ERR src and dest are the same\r\n");
+        return;
+    }
+
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        return;
+    }
+    //取出val
+    lobj *o = dictGetEntryVal(de);
+    incrRefCount(o);    //被弄到新的key里（引用加1），原来的val后面会被delete（引用减1）
+    //尝试add
+    if(dictAdd(c->dict, c->argv[2], o) == DICT_ERR){
+        if(nx){
+            //存在key则放弃
+            decrRefCount(o);
+            addReplySds(c, sdsnew("-ERR destination key exists"));
+            return;
+        }else{
+            dictReplace(c->dict, c->argv[2], o);
+        }
+    }else{
+        //如果ok，argv[2]里面的key已经被dict的结构指向了，所以最好干掉argv[1]的指向，以防被free
+        c->argv[2] = NULL;
+    }
+    dictDelete(c->dict, c->argv[1]);
+    server.dirty++;
+    addReply(c, shared.ok);
+}
+
+static void renameCommand(ledisClient *c){
+    renameGenericCommand(c, 0);
+}
+static void renamenxCommand(ledisClient *c){
+    renameGenericCommand(c, 1);
+}
+
+static void moveCommand(ledisClient *c){
+    dict *src = c->dict;    //备份指向
+    if(selectDb(c, atoi(c->argv[2])) == LEDIS_ERR){
+        addReplySds(c, sdsnew("-ERR target DB out of range\r\n"));
+        return;
+    }
+    dict *dst = c->dict;    //新的DB指向
+    c->dict = src;  //指回去
+
+    if(src == dst){ //不能一样
+        addReplySds(c, sdsnew("-ERR source DB is the same as target DB\r\n"));
+        return;
+    }
+
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        return;
+    }
+
+    //将key尝试放到新的DB里面
+    sds *key = dictGetEntryKey(de); //得是指针
+    lobj *o = dictGetEntryVal(de);
+    if(dictAdd(dst, key, o) == DICT_ERR){
+        addReplySds(c, sdsnew("-ERR target DB already contains the moved key\r\n"));
+        return;
+    }
+
+    //清理src的节点，但是只是移除结构并不能free，只是指向改变了而已
+    dictDeleteNoFree(src, c->argv[1]);
+    server.dirty++;
+    addReply(c, shared.ok);
+}
+
+static void pushGenericCommand(ledisClient *c, int where){
+    
+    lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
+    c->argv[2] = NULL;
+
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    lobj *lobj;
+    list *list;
+    if(de == NULL){
+        lobj = createListObject();
+        list = lobj->ptr;
+        if(where == LEDIS_HEAD){
+            if(!listAddNodeHead(list, ele)) oom("listAddNodeHead");
+        }else{
+            if(!listAddNodeTail(list, ele)) oom("listAddNodeTail");
+        }
+        dictAdd(c->dict, c->argv[1], lobj);
+        c->argv[1] = NULL;  //变成裸指针，防止arv[1]被free
+    }else{
+        lobj = dictGetEntryVal(de);
+        //检查类型，必须是list
+        if(lobj->type != LEDIS_LIST){
+            decrRefCount(ele);
+            addReplySds(c, sdsnew("-ERR push against existing key not holding a list\r\n"));
+            return;
+        }
+        list = lobj->ptr;
+        if(where == LEDIS_HEAD){
+            if(!listAddNodeHead(list, ele)) oom("listAddNodeHead");
+        }else{
+            if(!listAddNodeTail(list, ele)) oom("listAddNodeTail");
+        }
+    }
 }
 
 /*====================================== 主函数 ===============================*/

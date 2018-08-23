@@ -69,6 +69,58 @@ void setnxCommandTest(char *err, int sfd){
     printf("setnx command result: %s\n", res);
 }
 
+void keysCommandTest(char *err, int sfd){
+    
+    char *data = "keys *\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("keys command resultLength: %d\n", result);
+    printf("keys command result: %s\n", res);
+}
+
+void renameCommandTest(char *err, int sfd){
+    
+    char *data = "rename mykey yourkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("rename command resultLength: %d\n", result);
+    printf("rename command result: %s\n", res);
+}
+
+void renamenxCommandTest(char *err, int sfd){
+    
+    char *data = "renamenx yourkey theirkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("renamenx command resultLength: %d\n", result);
+    printf("renamenx command result: %s\n", res);
+}
+
+void moveCommandTest(char *err, int sfd){
+    
+    char *data = "move theirkey 1\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("move command resultLength: %d\n", result);
+    printf("move command result: %s\n", res);
+}
+
 void getCommandTest(char *err, int sfd){
     
     char *data = "get mykey\r\n";
@@ -211,6 +263,8 @@ int main(int argc, char *argv[]){
     setCommandTest(err, sfd);
     //测试setnx命令
     setnxCommandTest(err, sfd);
+    //测试keys命令
+    keysCommandTest(err, sfd);
     //测试get命令
     getCommandTest(err, sfd);
     //测试exists命令
@@ -223,12 +277,18 @@ int main(int argc, char *argv[]){
     randomKeyCommandTest(err, sfd);
     //测试lastsave命令
     lastsaveCommandTest(err, sfd);
+    //测试rename命令
+    renameCommandTest(err, sfd);
+    //测试renamenx命令
+    renamenxCommandTest(err, sfd);
+    //测试move命令
+    moveCommandTest(err, sfd);
     //测试shutdown命令
-    shutdownCommandTest(err, sfd);
+    //shutdownCommandTest(err, sfd);
     //测试del命令
     //delCommandTest(err, sfd);
     //测试select命令
-    //selectCommandTest(err, sfd);
+    selectCommandTest(err, sfd);
     //sleep(3600);
 
     exit(EXIT_SUCCESS);
