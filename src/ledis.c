@@ -1358,6 +1358,14 @@ static void pushGenericCommand(ledisClient *c, int where){
     }
 }
 
+static void lpushCommand(ledisClient *c){
+    pushGenericCommand(c, LEDIS_HEAD);
+}
+
+static void rpushCommand(ledisClient *c){
+    pushGenericCommand(c, LEDIS_TAIL);
+}
+
 /*====================================== 主函数 ===============================*/
 
 int main(int argc, char *argv[]){
