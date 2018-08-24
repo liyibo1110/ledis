@@ -172,6 +172,7 @@ static void moveCommand(ledisClient *c);
 
 static void lpushCommand(ledisClient *c);
 static void rpushCommand(ledisClient *c);
+static void llenCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -195,6 +196,7 @@ static struct ledisCommand cmdTable[] = {
     {"move",moveCommand,3,LEDIS_CMD_INLINE},
     {"lpush",lpushCommand,3,LEDIS_CMD_BULK},
     {"rpush",rpushCommand,3,LEDIS_CMD_BULK},
+    {"llen",llenCommand,2,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -1356,6 +1358,8 @@ static void pushGenericCommand(ledisClient *c, int where){
             if(!listAddNodeTail(list, ele)) oom("listAddNodeTail");
         }
     }
+    server.dirty++;
+    addReply(c, shared.ok);
 }
 
 static void lpushCommand(ledisClient *c){
@@ -1364,6 +1368,22 @@ static void lpushCommand(ledisClient *c){
 
 static void rpushCommand(ledisClient *c){
     pushGenericCommand(c, LEDIS_TAIL);
+}
+
+static void llenCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_LIST){
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", listLength((list*)o->ptr)));
+        }else{
+            addReplySds(c, sdsnew("-1\r\n"));
+            return;
+        }
+    }
 }
 
 /*====================================== 主函数 ===============================*/

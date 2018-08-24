@@ -225,6 +225,53 @@ void delCommandTest(char *err, int sfd){
     printf("del command result: %s\n", res);
 }
 
+void lpushCommandTest(char *err, int sfd){
+    
+    char *msg = "mylistvalue1";
+    char data[1024];
+    char res[1024];
+    memset(res, 0, 1024);
+    sprintf(data, "lpush mylistkey %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("lpush command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+
+    //开始读
+    int result = read(sfd, res, 1024);
+    printf("lpush command resultLength: %d\n", result);
+    printf("lpush command result: %s\n", res);
+}
+
+void rpushCommandTest(char *err, int sfd){
+    
+    char *msg = "mylistvalue2";
+    char data[1024];
+    char res[1024];
+    memset(res, 0, 1024);
+    sprintf(data, "rpush mylistkey %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("rpush command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+
+    //开始读
+    int result = read(sfd, res, 1024);
+    printf("rpush command resultLength: %d\n", result);
+    printf("rpush command result: %s\n", res);
+}
+
+void llenCommandTest(char *err, int sfd){
+    
+    char *data = "llen mylistkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("llen command resultLength: %d\n", result);
+    printf("llen command result: %s\n", res);
+}
+
 void selectCommandTest(char *err, int sfd){
     
     char *data = "select 1\r\n";
@@ -283,6 +330,14 @@ int main(int argc, char *argv[]){
     renamenxCommandTest(err, sfd);
     //测试move命令
     moveCommandTest(err, sfd);
+
+    //测试lpush命令
+    lpushCommandTest(err, sfd);
+    //测试rpush命令
+    rpushCommandTest(err, sfd);
+    //测试llen命令
+    llenCommandTest(err, sfd);
+
     //测试shutdown命令
     //shutdownCommandTest(err, sfd);
     //测试del命令
