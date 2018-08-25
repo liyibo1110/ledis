@@ -272,6 +272,45 @@ void llenCommandTest(char *err, int sfd){
     printf("llen command result: %s\n", res);
 }
 
+void lindexCommandTest(char *err, int sfd){
+    
+    char *data = "lindex mylistkey 1\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("lindex command resultLength: %d\n", result);
+    printf("lindex command result: %s\n", res);
+}
+
+void lpopCommandTest(char *err, int sfd){
+    
+    char *data = "lpop mylistkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("lpop command resultLength: %d\n", result);
+    printf("lpop command result: %s\n", res);
+}
+
+void rpopCommandTest(char *err, int sfd){
+    
+    char *data = "rpop mylistkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("rpop command resultLength: %d\n", result);
+    printf("rpop command result: %s\n", res);
+}
+
 void selectCommandTest(char *err, int sfd){
     
     char *data = "select 1\r\n";
@@ -337,7 +376,12 @@ int main(int argc, char *argv[]){
     rpushCommandTest(err, sfd);
     //测试llen命令
     llenCommandTest(err, sfd);
-
+    //测试lindex命令
+    lindexCommandTest(err, sfd);
+    //测试lpop命令
+    lpopCommandTest(err, sfd);
+    //测试rpop命令
+    rpopCommandTest(err, sfd);
     //测试shutdown命令
     //shutdownCommandTest(err, sfd);
     //测试del命令

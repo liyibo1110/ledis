@@ -172,7 +172,10 @@ static void moveCommand(ledisClient *c);
 
 static void lpushCommand(ledisClient *c);
 static void rpushCommand(ledisClient *c);
+static void lpopCommand(ledisClient *c);
+static void rpopCommand(ledisClient *c);
 static void llenCommand(ledisClient *c);
+static void lindexCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -196,7 +199,10 @@ static struct ledisCommand cmdTable[] = {
     {"move",moveCommand,3,LEDIS_CMD_INLINE},
     {"lpush",lpushCommand,3,LEDIS_CMD_BULK},
     {"rpush",rpushCommand,3,LEDIS_CMD_BULK},
+    {"lpop",lpopCommand,2,LEDIS_CMD_INLINE},
+    {"rpop",rpopCommand,2,LEDIS_CMD_INLINE},
     {"llen",llenCommand,2,LEDIS_CMD_INLINE},
+    {"lindex",lindexCommand,3,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -1370,6 +1376,47 @@ static void rpushCommand(ledisClient *c){
     pushGenericCommand(c, LEDIS_TAIL);
 }
 
+static void popGenericCommand(ledisClient *c, int where){
+    
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.nil);
+    }else{
+       lobj *o = dictGetEntryVal(de);
+       if(o->type != LEDIS_LIST){
+           char *err = "POP against key not holding a list value";
+           addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+       }else{
+           list *list = o->ptr;
+           listNode *node;
+           if(where == LEDIS_HEAD){
+               node = listFirst(list);
+           }else{
+               node = listLast(list);
+           }
+           if(node == NULL){
+               addReply(c, shared.nil);
+           }else{
+               lobj *ele = listNodeValue(node);
+               addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(ele->ptr)));
+               addReply(c, ele);
+               addReply(c, shared.crlf);
+               //因为是pop操作，所以要删掉
+               listDelNode(list, node);
+               server.dirty++;  //结构一定发生了变化
+           }
+       }
+    }
+}
+
+static void lpopCommand(ledisClient *c){
+    popGenericCommand(c, LEDIS_HEAD);
+}
+
+static void rpopCommand(ledisClient *c){
+    popGenericCommand(c, LEDIS_TAIL);
+}
+
 static void llenCommand(ledisClient *c){
     dictEntry *de = dictFind(c->dict, c->argv[1]);
     if(de == NULL){
@@ -1381,6 +1428,36 @@ static void llenCommand(ledisClient *c){
             addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", listLength((list*)o->ptr)));
         }else{
             addReplySds(c, sdsnew("-1\r\n"));
+            return;
+        }
+    }
+}
+
+static void lindexCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    int index = atoi(c->argv[2]);
+    if(de == NULL){
+        addReply(c, shared.nil);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_LIST){
+            list *list = o->ptr;
+            listNode *node = listIndex(list, index);
+            if(node == NULL){
+                addReply(c, shared.nil);
+                return;
+            }else{
+                lobj *ele = listNodeValue(node);
+                //返回BULK类型
+                addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(ele->ptr)));
+                addReply(c, ele);
+                addReply(c, shared.crlf);
+                return;
+            }
+        }else{
+            char *err = "LINDEX against key not holding a list value";
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
             return;
         }
     }
