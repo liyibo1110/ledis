@@ -176,6 +176,8 @@ static void lpopCommand(ledisClient *c);
 static void rpopCommand(ledisClient *c);
 static void llenCommand(ledisClient *c);
 static void lindexCommand(ledisClient *c);
+static void lrangeCommand(ledisClient *c);
+static void ltrimCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -203,6 +205,8 @@ static struct ledisCommand cmdTable[] = {
     {"rpop",rpopCommand,2,LEDIS_CMD_INLINE},
     {"llen",llenCommand,2,LEDIS_CMD_INLINE},
     {"lindex",lindexCommand,3,LEDIS_CMD_INLINE},
+    {"lrange",lrangeCommand,4,LEDIS_CMD_INLINE},
+    {"ltrim",ltrimCommand,4,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -1076,6 +1080,102 @@ static void freeSetObject(lobj *o){
     o = o;
 }
 
+/*====================================== DB SAVE/LOAD相关 ===============================*/
+
+static void saveDb(char *filename){
+
+    dictIterator *di = NULL;
+    char tmpfile[256];
+    //建立临时文件
+    snprintf(tmpfile, 256, "temp-%d.%ld.rdb", (int)time(NULL), (long)random());
+
+    FILE *fp = fopen(tmpfile, "w");
+    if(!fp){
+        ledisLog(LEDIS_WARNING," Failed saving the DB: %s", strerror(errno));
+        return LEDIS_ERR;
+    }
+    //写死固定的开头标识字符
+    if(fwrite("LEDIS0000", 9, 1, fp) == 0) goto werr;
+    dictEntry *de;
+    //需要用变量位数确定的类型，不能用int这类平台异同的类型
+    uint8_t type;  
+    uint32_t len;
+    for(int i = 0; i < server.dbnum; i++){
+        dict *dict = server.dict[i];
+        if(dictGetHashTableUsed(dict) == 0) continue;
+        di = dictGetIterator(dict);
+        if(!di){    //为啥不goto werr
+            fclose(fp);
+            return LEDIS_ERR;
+        }
+
+        //写当前DB的元信息，DB文件不一定在本机，所以多字节整型需要统一转大字序列
+        type = LEDIS_SELECTDB;  //只有1个字节
+        len = htonl(i); //4个字节必须要转
+        if(fwrite(&type, 1, 1, fp) == 0) goto werr;
+        if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+
+        //利用迭代器，遍历当前DB的每个entry
+        while((de = dictNext(di)) != NULL){
+            sds key = dictGetEntryKey(de);
+            lobj *o = dictGetEntryVal(de);
+            type = o->type;
+            len = htonl(sdslen(key));
+            //写入key信息
+            if(fwrite(&type, 1, 1, fp) == 0) goto werr; //对应val的类型
+            if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+            if(fwrite(key, sdslen(key), 1, fp) == 0) goto werr;
+            //根据不同类型，写val信息
+            if(type = LEDIS_STRING){
+                sds sval = o->ptr;
+                len = htonl(sdslen(sval));
+                if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+                if(fwrite(sval, sdslen(sval), 1, fp) == 0) goto werr;
+            }else if(type == LEDIS_LIST){
+                list *list = o->ptr;
+                listNode *ln = list->head;
+                len = htonl(listLength(list));  //先写list的长度
+                if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+                while(ln){
+                    lobj *eleobj = listNodeValue(ln);
+                    len = htonl(sdslen(eleobj->ptr));
+                    if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+                    if(fwrite(eleobj->ptr, sdslen(eleobj->ptr), 1, fp) == 0) goto werr;
+                    ln = ln->next;
+                }
+            }else{
+                //只能是上面2种
+                assert(0 != 0);
+            }
+        }
+        dictReleaseIterator(di);
+    }
+    
+    //结尾标识
+    type = LEDIS_EOF;
+    if(fwrite(&type, 1, 1, fp) == 0) goto werr;
+    fclose(fp);
+
+    //临时文件生成完毕，要重命名为正式的文件名
+    if(rename(tmpfile, filename) == -1){
+        ledisLog(LEDIS_WARNING, "Error moving temp DB file on the final destination: %s"), strerror(errno);
+        unlink(tmpfile);
+        return LEDIS_ERR;
+    }
+
+    ledisLog(LEDIS_NOTICE, "DB saved on disk");
+    server.dirty = 0;
+    server.lastsave = time(NULL);
+    return LEDIS_OK;
+
+werr:   //统一清理
+    fclose(fp);
+    ledisLog(LEDIS_WARNING, "Error saving DB on disk: %s", strerror(errno));
+    if(di)  dictReleaseIterator(di);
+    return LEDIS_ERR;
+}
+
+
 /*====================================== 各种命令实现 ===============================*/
 
 static void pingCommand(ledisClient *c){
@@ -1458,6 +1558,99 @@ static void lindexCommand(ledisClient *c){
         }else{
             char *err = "LINDEX against key not holding a list value";
             addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+            return;
+        }
+    }
+}
+
+static void lrangeCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    int start = atoi(c->argv[2]);
+    int end = atoi(c->argv[3]);
+    if(de == NULL){
+        addReply(c, shared.nil);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_LIST){
+            list *list = o->ptr;
+            int llen = listLength(list);
+
+            //校正入参start和end
+            if(start < 0) start = llen + start;
+            if(end < 0) end = llen + end;
+            if(start < 0) start = 0;    //start为大负数，依然会小于0
+            if(end < 0) end = 0;    //end为大负数，依然会小于0
+
+            if(start > end || start >= llen){
+                addReply(c, shared.zero);
+                return;
+            }
+            if(end >= llen) end = llen - 1;
+            int rangelen = (end - start) + 1;   //即最终截取多少个元素
+
+            listNode *node = listIndex(list, start);
+            //返回格式为多行BULK，即第一个数字是元素总个数
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", rangelen));
+            lobj *ele;
+            for(int i = 0; i < rangelen; i++){
+                ele = listNodeValue(node);
+                //返回BULK类型
+                addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(ele->ptr)));
+                addReply(c, ele);
+                addReply(c, shared.crlf);
+                node = node->next;
+            }
+            return;
+        }else{
+            char *err = "LRANGE against key not holding a list value";
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+            return;
+        }
+    }
+}
+
+static void ltrimCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    int start = atoi(c->argv[2]);
+    int end = atoi(c->argv[3]);
+    if(de == NULL){
+        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_LIST){
+            list *list = o->ptr;
+            int llen = listLength(list);
+            int ltrim, rtrim;
+            //校正入参start和end
+            if(start < 0) start = llen + start;
+            if(end < 0) end = llen + end;
+            if(start < 0) start = 0;    //start为大负数，依然会小于0
+            if(end < 0) end = 0;    //end为大负数，依然会小于0
+
+            if(start > end || start >= llen){
+                ltrim = llen;
+                rtrim = 0;
+            }else{
+                if(end >= llen) end = llen - 1;
+                ltrim = start;
+                rtrim = llen - end - 1;
+            }
+
+            listNode *node;
+            for(int i = 0; i < ltrim; i++){
+                node = listFirst(list);
+                listDelNode(list, node);
+            }
+            for(int j = 0; j < rtrim; j++){
+                node = listLast(list);
+                listDelNode(list, node);
+            }
+            addReply(c, shared.ok);
+            return;
+        }else{
+            addReplySds(c, sdsnew("-ERR LTRIM against key not holding a list value"));
             return;
         }
     }

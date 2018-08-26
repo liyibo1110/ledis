@@ -285,6 +285,19 @@ void lindexCommandTest(char *err, int sfd){
     printf("lindex command result: %s\n", res);
 }
 
+void lrangeCommandTest(char *err, int sfd){
+    
+    char *data = "lrange mylistkey 0 1\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[1024];
+    memset(res, 0, 1024);
+    int result = read(sfd, res, 1024);
+    printf("lrange command resultLength: %d\n", result);
+    printf("lrange command result: %s\n", res);
+}
+
 void lpopCommandTest(char *err, int sfd){
     
     char *data = "lpop mylistkey\r\n";
@@ -378,6 +391,8 @@ int main(int argc, char *argv[]){
     llenCommandTest(err, sfd);
     //测试lindex命令
     lindexCommandTest(err, sfd);
+    //测试lrange命令
+    lrangeCommandTest(err, sfd);
     //测试lpop命令
     lpopCommandTest(err, sfd);
     //测试rpop命令
