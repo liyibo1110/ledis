@@ -148,10 +148,14 @@ static void freeClient(ledisClient *c);
 static void addReply(ledisClient *c, lobj *obj);
 static void addReplySds(ledisClient *c, sds s);
 
+static int saveDbBackground(char *filename);
+
 //所有函数均只在本文件被调用
 static void pingCommand(ledisClient *c);
 static void echoCommand(ledisClient *c);
 static void dbsizeCommand(ledisClient *c);
+static void saveCommand(ledisClient *c);
+static void bgsaveCommand(ledisClient *c);
 
 static void setCommand(ledisClient *c);
 static void setnxCommand(ledisClient *c);
@@ -184,6 +188,8 @@ static struct ledisCommand cmdTable[] = {
     {"ping",pingCommand,1,LEDIS_CMD_INLINE},
     {"echo",echoCommand,2,LEDIS_CMD_BULK},
     {"dbsize",dbsizeCommand,1,LEDIS_CMD_INLINE},
+    {"save",saveCommand,1,LEDIS_CMD_INLINE},
+    {"bgsave",bgsaveCommand,1,LEDIS_CMD_INLINE},
     {"set",setCommand,3,LEDIS_CMD_BULK},
     {"setnx",setnxCommand,3,LEDIS_CMD_BULK},
     {"get",getCommand,2,LEDIS_CMD_INLINE},
@@ -482,8 +488,31 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     //尝试bgsave，暂不实现
     if(server.bgsaveinprogress){
         //如果正在bgsave，则阻塞
+        int statloc;
+        //非阻塞式wait
+        if(wait4(-1, &statloc, WNOHANG, NULL)){
+            int exitcode = WEXITSTATUS(statloc);
+            if(exitcode == 0){  //成功完成
+                ledisLog(LEDIS_NOTICE, "Background saving terminated with success");
+                server.dirty = 0;
+                server.lastsave = time(NULL);
+            }else{
+                ledisLog(LEDIS_WARNING, "Background saving error");
+            }
+            server.bgsaveinprogress = 0;    //只有在这里还原标记
+        }
     }else{
         //检测是否需要bgsave
+        time_t now = time(NULL);
+        for(int j = 0; j < server.saveparamslen; j++){
+            struct saveparam *sp = server.saveparams+j;
+            if(server.dirty >= sp->changes && now - server.lastsave > sp->seconds){
+                ledisLog(LEDIS_NOTICE, "%d changes in %d seconds. Saving...",
+                            sp->changes, sp->seconds);
+                saveDbBackground("dump.ldb");
+                break;
+            }
+        }
     }
 
     return 1000;
@@ -1082,7 +1111,7 @@ static void freeSetObject(lobj *o){
 
 /*====================================== DB SAVE/LOAD相关 ===============================*/
 
-static void saveDb(char *filename){
+static int saveDb(char *filename){
 
     dictIterator *di = NULL;
     char tmpfile[256];
@@ -1126,7 +1155,7 @@ static void saveDb(char *filename){
             if(fwrite(&len, 4, 1, fp) == 0) goto werr;
             if(fwrite(key, sdslen(key), 1, fp) == 0) goto werr;
             //根据不同类型，写val信息
-            if(type = LEDIS_STRING){
+            if(type == LEDIS_STRING){
                 sds sval = o->ptr;
                 len = htonl(sdslen(sval));
                 if(fwrite(&len, 4, 1, fp) == 0) goto werr;
@@ -1175,6 +1204,139 @@ werr:   //统一清理
     return LEDIS_ERR;
 }
 
+static int saveDbBackground(char *filename){
+    if(server.bgsaveinprogress) return LEDIS_ERR;
+    pid_t childpid;
+    if((childpid = fork()) == 0){
+        //子进程
+        close(server.fd);   //不需要这个衍生品
+        if(saveDb(filename) == LEDIS_OK){
+            exit(EXIT_SUCCESS);
+        }else{
+            exit(EXIT_FAILURE);
+        }
+    }else{
+        //主进程
+        ledisLog(LEDIS_NOTICE, "Background saving started by pid %d", childpid);
+        server.bgsaveinprogress = 1;    //在serverCron中才能得到子进程完毕的事件
+        return LEDIS_OK;
+    }
+    return LEDIS_OK;    //到不了这里
+}
+
+static int loadDb(char *filename){
+
+    char buf[LEDIS_LOADBUF_LEN];    //中转站
+    char vbuf[LEDIS_LOADBUF_LEN];   //中转站
+    char *key = NULL, *val = NULL;
+    uint8_t type;
+    uint32_t klen, vlen, dbid;
+    int retval;
+    dict *dict = server.dict[0];
+
+    FILE *fp = fopen(filename, "r");
+    if(!fp) return LEDIS_ERR;
+    //验证文件签名
+    if(fread(buf, 9, 1, fp) == 0)   goto eoferr;
+    if(memcmp(buf, "LEDIS0000", 9) != 0){
+        fclose(fp);
+        ledisLog(LEDIS_WARNING, "Wrong signature trying to load DB from file");
+        return LEDIS_ERR;
+    }
+
+    while(true){
+        lobj *o;
+
+        //获取type，根据不同的type做不同的操作
+        if(fread(&type, 1, 1, fp) == 0) goto eoferr;
+        if(type == LEDIS_EOF) break;    //eof说明读完了
+        if(type == LEDIS_SELECTDB){
+            if(fread(&dbid, 4, 1, fp) == 0) goto eoferr;
+            dbid = ntohl(dbid); //必须转
+            if(dbid >= (unsigned)server.dbnum){
+                ledisLog(LEDIS_WARNING, "FATAL: Data file was created with a Ledis server compilied to handle more than %d databases. Exiting\n", server.dbnum);
+                exit(EXIT_FAILURE);
+            }
+            dict = server.dict[dbid];
+            continue;
+        }
+
+        //以下为正式数据type，后面肯定是key
+        if(fread(&klen, 4, 1, fp) == 0) goto eoferr;
+        klen = ntohl(klen);
+        if(klen <= LEDIS_LOADBUF_LEN){
+            key = buf;
+        }else{
+            key = malloc(klen);
+            if(!key) oom("Loading DB from file");
+        }
+        if(fread(key, klen, 1, fp) == 0) goto eoferr;
+        //处理val
+        if(type == LEDIS_STRING){
+            if(fread(&vlen, 4, 1, fp) == 0) goto eoferr;
+            vlen = ntohl(vlen);
+            if(vlen <= LEDIS_LOADBUF_LEN){
+                val = vbuf;
+            }else{
+                val = malloc(vlen);
+                if(!val) oom("Loading DB from file");
+            }
+            if(fread(val, vlen, 1, fp) == 0) goto eoferr;
+            o = createObject(LEDIS_STRING, sdsnewlen(val, vlen));
+        }else if(type == LEDIS_LIST){
+            uint32_t listlen;
+            if(fread(&listlen, 4, 1, fp) == 0) goto eoferr;
+            listlen = ntohl(listlen);
+            o = createListObject();
+            while(listlen--){
+                lobj *ele;
+
+                if(fread(&vlen, 4, 1, fp) == 0) goto eoferr;
+                vlen = ntohl(vlen);
+                if(vlen <= LEDIS_LOADBUF_LEN){
+                    val = vbuf;
+                }else{
+                    val = malloc(vlen);
+                    if(!val) oom("Loading DB from file");
+                }
+                
+                if(fread(val, vlen, 1, fp) == 0) goto eoferr;
+                ele = createObject(LEDIS_STRING, sdsnewlen(val, vlen));
+                //添加到list
+                if(!listAddNodeTail((list*)o->ptr, ele))    oom("listAddNodeTail");
+                //要清理val
+                if(val != vbuf) free(val);
+                val = NULL;
+            }
+        }else{
+            assert(0 != 0);
+        }
+
+        //lobj生成了，还需要弄到dict里
+        retval = dictAdd(dict, sdsnewlen(key, klen), o);
+        if(retval == DICT_ERR){
+            ledisLog(LEDIS_WARNING, "Loading DB, duplicated key found! Unrecoverable error, exiting now.");
+            exit(EXIT_FAILURE);
+        }
+
+        //清理
+        if(key != buf) free(key);
+        if(val != vbuf) free(val);
+        key = NULL;
+        val = NULL;
+    }
+
+    fclose(fp);
+    return LEDIS_OK;
+
+eoferr:
+    //并没有调用fclose(fp)？？？
+    if(key != buf) free(key);
+    if(val != vbuf) free(val);
+    ledisLog(LEDIS_WARNING, "Short read loading DB. unrecoverable error, exiting now.");
+    exit(EXIT_FAILURE); //load失败就直接退出
+    return LEDIS_ERR;   //到不了，函数必须要返回1个值而已
+}
 
 /*====================================== 各种命令实现 ===============================*/
 
@@ -1188,6 +1350,26 @@ static void echoCommand(ledisClient *c){
     addReply(c, shared.crlf);
     //已经被reply内部指向，要变成裸指针，防止被free
     c->argv[1] = NULL;
+}
+
+static void saveCommand(ledisClient *c){
+    if(saveDb("dump.ldb") == LEDIS_OK){
+        addReply(c, shared.ok);
+    }else{
+        addReply(c, shared.err);
+    }
+}
+
+static void bgsaveCommand(ledisClient *c){
+    if(server.bgsaveinprogress){
+        addReplySds(c, sdsnew("-ERR background save already in progress\r\n"));
+        return;
+    }
+    if(saveDbBackground("dump.ldb") == LEDIS_OK){
+        addReply(c, shared.ok);
+    }else{
+        addReply(c, shared.err);
+    }
 }
 
 static void dbsizeCommand(ledisClient *c){
@@ -1350,9 +1532,15 @@ static void lastsaveCommand(ledisClient *c){
 }
 
 static void shutdownCommand(ledisClient *c){
-    //暂时没有save
-    ledisLog(LEDIS_NOTICE, "server exit now, bye bye...");
-    exit(EXIT_SUCCESS);
+    ledisLog(LEDIS_WARNING, "User requested shutdown, saving DB...");
+    if(saveDb("dump.ldb") == LEDIS_OK){
+        ledisLog(LEDIS_NOTICE, "server exit now, bye bye...");
+        exit(EXIT_SUCCESS);
+    }else{
+        ledisLog(LEDIS_WARNING, "Error trying to save the DB, can't exit");
+        addReplySds(c, sdsnew("-ERR can't quit, problems saving the DB\r\n"));
+    }
+    
 }
 
 static void renameGenericCommand(ledisClient *c, int nx){
@@ -1660,6 +1848,8 @@ static void ltrimCommand(ledisClient *c){
 
 int main(int argc, char *argv[]){
 
+    LEDIS_NOTUSED(argc);
+    LEDIS_NOTUSED(argv);
     //初始化server配置
     initServerConfig();
     //初始化server
@@ -1673,8 +1863,10 @@ int main(int argc, char *argv[]){
         exit(EXIT_FAILURE);
     }
     ledisLog(LEDIS_NOTICE, "Server started");
-    //尝试恢复数据库dump.ldb文件，暂不开发
-
+    //尝试恢复数据库dump.ldb文件
+    if(loadDb("dump.ldb") == LEDIS_OK){
+        ledisLog(LEDIS_NOTICE, "DB loaded from disk");
+    }
     //假定恢复db用了5s
     //sleep(5);
 
