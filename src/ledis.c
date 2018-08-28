@@ -1159,7 +1159,7 @@ static int saveDb(char *filename){
                 sds sval = o->ptr;
                 len = htonl(sdslen(sval));
                 if(fwrite(&len, 4, 1, fp) == 0) goto werr;
-                if(fwrite(sval, sdslen(sval), 1, fp) == 0) goto werr;
+                if(sdslen(sval) && fwrite(sval, sdslen(sval), 1, fp) == 0) goto werr;
             }else if(type == LEDIS_LIST){
                 list *list = o->ptr;
                 listNode *ln = list->head;
@@ -1169,7 +1169,7 @@ static int saveDb(char *filename){
                     lobj *eleobj = listNodeValue(ln);
                     len = htonl(sdslen(eleobj->ptr));
                     if(fwrite(&len, 4, 1, fp) == 0) goto werr;
-                    if(fwrite(eleobj->ptr, sdslen(eleobj->ptr), 1, fp) == 0) goto werr;
+                    if(sdslen(eleobj->ptr) && fwrite(eleobj->ptr, sdslen(eleobj->ptr), 1, fp) == 0) goto werr;
                     ln = ln->next;
                 }
             }else{
@@ -1281,8 +1281,8 @@ static int loadDb(char *filename){
                 val = malloc(vlen);
                 if(!val) oom("Loading DB from file");
             }
-            if(fread(val, vlen, 1, fp) == 0) goto eoferr;
-            o = createObject(LEDIS_STRING, sdsnewlen(val, vlen));
+            if(vlen && fread(val, vlen, 1, fp) == 0) goto eoferr;
+            o = createObject(LEDIS_STRING, sdsnewlen(val, vlen));   //vlen可以为0，会构造没有buf的sds结构
         }else if(type == LEDIS_LIST){
             uint32_t listlen;
             if(fread(&listlen, 4, 1, fp) == 0) goto eoferr;
@@ -1300,7 +1300,7 @@ static int loadDb(char *filename){
                     if(!val) oom("Loading DB from file");
                 }
                 
-                if(fread(val, vlen, 1, fp) == 0) goto eoferr;
+                if(vlen && fread(val, vlen, 1, fp) == 0) goto eoferr;   //vlen可以为0，会构造没有buf的sds结构
                 ele = createObject(LEDIS_STRING, sdsnewlen(val, vlen));
                 //添加到list
                 if(!listAddNodeTail((list*)o->ptr, ele))    oom("listAddNodeTail");

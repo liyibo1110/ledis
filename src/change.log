@@ -1,0 +1,8 @@
+beta-3变化（主文件只有redis.c发生了变化，增加了新的命令）
+1.增加了自己的Changelog文件
+2.
+
+beta-2变化
+1.增加了基于ruby的演示客户端
+2.修改了部分README文字
+3.修改了saveDb和loadDb，对所有val的sds类型加入了长度非0判断，即sdslen返回0则只写长度为0,字符串不写入文件，读取的时候也是还原一个sdslen为0的sds结构
