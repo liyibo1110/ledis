@@ -21,10 +21,10 @@
 #include <errno.h>
 
 #include "ae.h"
-#include "anet.h"
 #include "sds.h"
-#include "adlist.h"
+#include "anet.h"
 #include "dict.h"
+#include "adlist.h"
 
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
@@ -421,6 +421,29 @@ dictType sdsDictType = {
     sdsDictKeyCompare,      //keyCompare函数
     sdsDictKeyDestructor,   //key清理函数
     sdsDictValDestructor,   //val清理函数
+};
+
+/**
+ * set类型里面的dict，key为lobj对象，type是sds
+ */ 
+static unsigned int setDictHashFunction(const void *key){
+    const lobj *o = key;
+    return dictGenHashFunction(o->ptr, sdslen((sds)o->ptr));
+}
+
+static int setDictKeyCompare(void *privdata, const void *key1, const void *key2){
+    const lobj *o1 = key1;
+    const lobj *o2 = key2;
+    return sdsDictKeyCompare(privdata, o1->ptr, o2->ptr);
+}
+
+dictType setDictType = {
+    setDictHashFunction,    //hash函数
+    NULL,                   //keyDup函数
+    NULL,                   //valDup函数
+    setDictKeyCompare,      //keyCompare函数
+    sdsDictKeyDestructor,   //key清理函数（看不懂，怎么又sds了）
+    NULL,   //val清理函数（压根就没有val）
 };
 
 /*========================= server相关实现 ===============================*/
@@ -824,7 +847,8 @@ static int processCommand(ledisClient *c){
         addReplySds(c, sdsnew("-ERR unknown command\r\n"));
         resetClient(c);
         return 1;
-    }else if(cmd->arity != c->argc){
+    }else if((cmd->arity > 0 && cmd->arity != c->argc) || 
+                (-cmd->arity > c->argc)){    //arity可以是负数了，但也和argc有限制关系
         addReplySds(c, sdsnew("-ERR wrong number of arguments\r\n"));
         resetClient(c);
         return 1;
@@ -1062,6 +1086,15 @@ static lobj *createListObject(void){
 }
 
 /**
+ * 创建一个set类型的对象，内部是个只有key的dict
+ */ 
+static lobj *createSetObject(void){
+    dict *d = dictCreate(&setDictType, NULL);
+    if(!d) oom("dictCreate");
+    return createObject(LEDIS_SET, d);
+}
+
+/**
  * 给obj的ref引用计数加1
  */ 
 static void incrRefCount(lobj *o){
@@ -1105,8 +1138,7 @@ static void freeListObject(lobj *o){
  * 释放set类型的obj
  */ 
 static void freeSetObject(lobj *o){
-    //什么也不做，此版本没有set这个类型
-    o = o;
+    dictRelease((dict*)o->ptr);
 }
 
 /*====================================== DB SAVE/LOAD相关 ===============================*/
@@ -1162,6 +1194,7 @@ static int saveDb(char *filename){
                 if(sdslen(sval) && fwrite(sval, sdslen(sval), 1, fp) == 0) goto werr;
             }else if(type == LEDIS_LIST){
                 list *list = o->ptr;
+                
                 listNode *ln = list->head;
                 len = htonl(listLength(list));  //先写list的长度
                 if(fwrite(&len, 4, 1, fp) == 0) goto werr;
@@ -1172,8 +1205,10 @@ static int saveDb(char *filename){
                     if(sdslen(eleobj->ptr) && fwrite(eleobj->ptr, sdslen(eleobj->ptr), 1, fp) == 0) goto werr;
                     ln = ln->next;
                 }
+            }else if(type == LEDIS_SET){
+                
             }else{
-                //只能是上面2种
+                //只能是上面3种
                 assert(0 != 0);
             }
         }
