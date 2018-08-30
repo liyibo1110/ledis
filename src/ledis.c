@@ -182,6 +182,8 @@ static void llenCommand(ledisClient *c);
 static void lindexCommand(ledisClient *c);
 static void lrangeCommand(ledisClient *c);
 static void ltrimCommand(ledisClient *c);
+
+static void typeCommand(ledisClient *c);
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -213,6 +215,7 @@ static struct ledisCommand cmdTable[] = {
     {"lindex",lindexCommand,3,LEDIS_CMD_INLINE},
     {"lrange",lrangeCommand,4,LEDIS_CMD_INLINE},
     {"ltrim",ltrimCommand,4,LEDIS_CMD_INLINE},
+    {"type",typeCommand,2,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -1162,9 +1165,9 @@ static int saveDb(char *filename){
     uint8_t type;  
     uint32_t len;
     for(int i = 0; i < server.dbnum; i++){
-        dict *dict = server.dict[i];
-        if(dictGetHashTableUsed(dict) == 0) continue;
-        di = dictGetIterator(dict);
+        dict *d = server.dict[i];
+        if(dictGetHashTableUsed(d) == 0) continue;
+        di = dictGetIterator(d);
         if(!di){    //为啥不goto werr
             fclose(fp);
             return LEDIS_ERR;
@@ -1206,7 +1209,20 @@ static int saveDb(char *filename){
                     ln = ln->next;
                 }
             }else if(type == LEDIS_SET){
-                
+                dict *set = o->ptr;
+                dictIterator *di = dictGetIterator(set);
+                dictEntry *de;
+
+                if(!set) oom("dictGetIterator");
+                len = htonl(dictGetHashTableUsed(set));
+                if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+                while((de = dictNext(di)) != NULL){
+                    lobj *eleobj = dictGetEntryKey(de);
+                    len = htonl(sdslen(eleobj->ptr));
+                    if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+                    if(sdslen(eleobj->ptr) && fwrite(eleobj->ptr, sdslen(eleobj->ptr), 1, fp) == 0) goto werr;
+                }
+                dictReleaseIterator(di);
             }else{
                 //只能是上面3种
                 assert(0 != 0);
@@ -1234,6 +1250,7 @@ static int saveDb(char *filename){
 
 werr:   //统一清理
     fclose(fp);
+    unlink(tmpfile);    //也得删
     ledisLog(LEDIS_WARNING, "Error saving DB on disk: %s", strerror(errno));
     if(di)  dictReleaseIterator(di);
     return LEDIS_ERR;
@@ -1267,7 +1284,7 @@ static int loadDb(char *filename){
     uint8_t type;
     uint32_t klen, vlen, dbid;
     int retval;
-    dict *dict = server.dict[0];
+    dict *d = server.dict[0];
 
     FILE *fp = fopen(filename, "r");
     if(!fp) return LEDIS_ERR;
@@ -1292,7 +1309,7 @@ static int loadDb(char *filename){
                 ledisLog(LEDIS_WARNING, "FATAL: Data file was created with a Ledis server compilied to handle more than %d databases. Exiting\n", server.dbnum);
                 exit(EXIT_FAILURE);
             }
-            dict = server.dict[dbid];
+            d = server.dict[dbid];
             continue;
         }
 
@@ -1318,11 +1335,11 @@ static int loadDb(char *filename){
             }
             if(vlen && fread(val, vlen, 1, fp) == 0) goto eoferr;
             o = createObject(LEDIS_STRING, sdsnewlen(val, vlen));   //vlen可以为0，会构造没有buf的sds结构
-        }else if(type == LEDIS_LIST){
+        }else if(type == LEDIS_LIST || type == LEDIS_SET){
             uint32_t listlen;
             if(fread(&listlen, 4, 1, fp) == 0) goto eoferr;
             listlen = ntohl(listlen);
-            o = createListObject();
+            o = (type == LEDIS_LIST) ? createListObject() : createSetObject();
             while(listlen--){
                 lobj *ele;
 
@@ -1337,8 +1354,13 @@ static int loadDb(char *filename){
                 
                 if(vlen && fread(val, vlen, 1, fp) == 0) goto eoferr;   //vlen可以为0，会构造没有buf的sds结构
                 ele = createObject(LEDIS_STRING, sdsnewlen(val, vlen));
-                //添加到list
-                if(!listAddNodeTail((list*)o->ptr, ele))    oom("listAddNodeTail");
+                //添加到list或set的dict中
+                if(type == LEDIS_LIST){
+                    if(!listAddNodeTail((list*)o->ptr, ele)) oom("listAddNodeTail");
+                }else{  //否则是SET
+                    if(dictAdd((dict*)o->ptr, ele, NULL) == DICT_ERR) oom("dictAdd");
+                }
+                
                 //要清理val
                 if(val != vbuf) free(val);
                 val = NULL;
@@ -1348,7 +1370,7 @@ static int loadDb(char *filename){
         }
 
         //lobj生成了，还需要弄到dict里
-        retval = dictAdd(dict, sdsnewlen(key, klen), o);
+        retval = dictAdd(d, sdsnewlen(key, klen), o);
         if(retval == DICT_ERR){
             ledisLog(LEDIS_WARNING, "Loading DB, duplicated key found! Unrecoverable error, exiting now.");
             exit(EXIT_FAILURE);
@@ -1525,11 +1547,9 @@ static void selectCommand(ledisClient *c){
 }
 
 static void randomKeyCommand(ledisClient *c){
-    
     dictEntry *de = dictGetRandomKey(c->dict);
     if(de){
-        lobj *o = dictGetEntryVal(de);
-        addReply(c, o);
+        addReplySds(c, sdsdup(dictGetEntryKey(de)));
         addReply(c, shared.crlf);
     }else{
         addReply(c, shared.crlf);
@@ -1877,6 +1897,25 @@ static void ltrimCommand(ledisClient *c){
             return;
         }
     }
+}
+
+static void typeCommand(ledisClient *c){
+    
+    char *type;
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        type = "none";
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        switch(o->type){
+            case LEDIS_STRING: type = "string"; break;
+            case LEDIS_LIST: type = "list"; break;
+            case LEDIS_SET: type = "set"; break;
+            default: type = "unknown"; break;
+        }
+    }
+    addReplySds(c, sdsnew(type));
+    addReply(c, shared.crlf);
 }
 
 /*====================================== 主函数 ===============================*/
