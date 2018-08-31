@@ -136,7 +136,6 @@ sds sdscatprintf(sds s, const char *fmt, ...){
     char *buf;
     size_t buflen = 32;
 
-    va_start(ap, fmt);
     while(true){
         buf = malloc(buflen);
 #ifdef SDS_ABORT_ON_OOM
@@ -145,7 +144,9 @@ sds sdscatprintf(sds s, const char *fmt, ...){
         if(buf == NULL) return NULL;
 #endif
         buf[buflen-2] = '\0';   //将倒数第二个字节打个标记，用来观察目前容量是否够用
+        va_start(ap, fmt);
         vsnprintf(buf, buflen, fmt, ap);
+        va_end(ap);
         if(buf[buflen-2] != '\0'){  //说明传入的字符串装不下，需要加倍后重来
             free(buf);
             buflen *= 2;
@@ -153,7 +154,6 @@ sds sdscatprintf(sds s, const char *fmt, ...){
         }
         break;
     }
-    va_end(ap);
     char *t = sdscat(s, buf);
     free(buf);
     return t;

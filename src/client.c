@@ -349,6 +349,24 @@ void bgsaveCommandTest(char *err, int sfd){
     printf("bgsave command result: %s\n", res);
 }
 
+void lsetCommandTest(char *err, int sfd){
+    
+    CLIENT_NOTUSED(err);
+    char *msg = "mylistvalue3";
+    char data[WRITE_BUF_SIZE];
+    char res[READ_BUF_SIZE];
+    memset(res, 0, READ_BUF_SIZE);
+    sprintf(data, "lset mylistkey 0 %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("lset command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+
+    //开始读
+    int result = read(sfd, res, READ_BUF_SIZE);
+    printf("lset command resultLength: %d\n", result);
+    printf("lset command result: %s\n", res);
+}
+
 void lpopCommandTest(char *err, int sfd){
     
     CLIENT_NOTUSED(err);
@@ -391,6 +409,98 @@ void selectCommandTest(char *err, int sfd){
     printf("select command result: %s\n", res);
 }
 
+void saddCommandTest(char *err, int sfd){
+    
+    CLIENT_NOTUSED(err);
+    char *msg = "set1";
+    char data[WRITE_BUF_SIZE];
+    char res[READ_BUF_SIZE];
+    memset(res, 0, READ_BUF_SIZE);
+    sprintf(data, "sadd mysetkey %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("sadd command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+    //开始读
+    int result = read(sfd, res, READ_BUF_SIZE);
+    printf("sadd command1 resultLength: %d\n", result);
+    printf("sadd command1 result: %s\n", res);
+
+    //再来一个
+    msg = "set2";
+    sprintf(data, "sadd mysetkey %d\r\n%s\r\n", (int)strlen(msg), msg);
+    printf("sadd command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+    //开始读
+    result = read(sfd, res, READ_BUF_SIZE);
+    printf("sadd command2 resultLength: %d\n", result);
+    printf("sadd command2 result: %s\n", res);
+
+}
+
+void sismemberCommandTest(char *err, int sfd){
+    
+    CLIENT_NOTUSED(err);
+    char *msg = "set2";
+    char data[WRITE_BUF_SIZE];
+    char res[READ_BUF_SIZE];
+    memset(res, 0, READ_BUF_SIZE);
+    sprintf(data, "sismember mysetkey %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("sismember command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+
+    //开始读
+    int result = read(sfd, res, READ_BUF_SIZE);
+    printf("lismember command resultLength: %d\n", result);
+    printf("lismember command result: %s\n", res);
+}
+
+void smembersCommandTest(char *err, int sfd){
+    
+    CLIENT_NOTUSED(err);
+    char *data = "smembers mysetkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[READ_BUF_SIZE];
+    memset(res, 0, READ_BUF_SIZE);
+    int result = read(sfd, res, READ_BUF_SIZE);
+    printf("smembers command resultLength: %d\n", result);
+    printf("smembers command result: %s\n", res);
+}
+
+void sremCommandTest(char *err, int sfd){
+    
+    CLIENT_NOTUSED(err);
+    char *msg = "set2";
+    char data[WRITE_BUF_SIZE];
+    char res[READ_BUF_SIZE];
+    memset(res, 0, READ_BUF_SIZE);
+    sprintf(data, "srem mysetkey %d\r\n%s\r\n", (int)strlen(msg), msg);
+    
+    printf("srem command send: %s\n", data);
+    anetWrite(sfd, data, (int)strlen(data));
+
+    //开始读
+    int result = read(sfd, res, READ_BUF_SIZE);
+    printf("lrem command resultLength: %d\n", result);
+    printf("lrem command result: %s\n", res);
+}
+
+void scardCommandTest(char *err, int sfd){
+    
+    CLIENT_NOTUSED(err);
+    char *data = "scard mysetkey\r\n";
+    anetWrite(sfd, data, (int)strlen(data));
+    
+    //开始读
+    char res[READ_BUF_SIZE];
+    memset(res, 0, READ_BUF_SIZE);
+    int result = read(sfd, res, READ_BUF_SIZE);
+    printf("scard command resultLength: %d\n", result);
+    printf("scard command result: %s\n", res);
+}
+
 void shutdownCommandTest(char *err, int sfd){
     
     CLIENT_NOTUSED(err);
@@ -416,44 +526,46 @@ int main(int argc, char *argv[]){
     //测试dbsize命令
     dbsizeCommandTest(err, sfd);
     //测试set命令
-    setCommandTest(err, sfd);
+    //setCommandTest(err, sfd);
     //测试setnx命令
-    setnxCommandTest(err, sfd);
+    //setnxCommandTest(err, sfd);
     //测试keys命令
-    keysCommandTest(err, sfd);
+    //keysCommandTest(err, sfd);
     //测试get命令
-    getCommandTest(err, sfd);
+    //getCommandTest(err, sfd);
     //测试exists命令
-    existsCommandTest(err, sfd);
+    //existsCommandTest(err, sfd);
     //测试incr命令
-    incrCommandTest(err, sfd);
+    //incrCommandTest(err, sfd);
     //测试decr命令
-    decrCommandTest(err, sfd);
+    //decrCommandTest(err, sfd);
     //测试randomKey命令
-    randomKeyCommandTest(err, sfd);
+    //randomKeyCommandTest(err, sfd);
     //测试lastsave命令
-    lastsaveCommandTest(err, sfd);
+    //lastsaveCommandTest(err, sfd);
     //测试rename命令
-    renameCommandTest(err, sfd);
+    //renameCommandTest(err, sfd);
     //测试renamenx命令
-    renamenxCommandTest(err, sfd);
+    //renamenxCommandTest(err, sfd);
     //测试move命令
-    moveCommandTest(err, sfd);
+    //moveCommandTest(err, sfd);
 
     //测试lpush命令
     lpushCommandTest(err, sfd);
     //测试rpush命令
     rpushCommandTest(err, sfd);
     //测试llen命令
-    llenCommandTest(err, sfd);
+    //llenCommandTest(err, sfd);
     //测试lindex命令
-    lindexCommandTest(err, sfd);
+    //lindexCommandTest(err, sfd);
     //测试lrange命令
-    lrangeCommandTest(err, sfd);
+    //lrangeCommandTest(err, sfd);
     //测试save命令
-    saveCommandTest(err, sfd);
+    //saveCommandTest(err, sfd);
     //测试bgsave命令
-    bgsaveCommandTest(err, sfd);
+    //bgsaveCommandTest(err, sfd);
+    //测试lset命令
+    lsetCommandTest(err, sfd);
     //测试lpop命令
     lpopCommandTest(err, sfd);
     //测试rpop命令
@@ -464,6 +576,18 @@ int main(int argc, char *argv[]){
     //delCommandTest(err, sfd);
     //测试select命令
     selectCommandTest(err, sfd);
+
+    //测试sadd命令
+    saddCommandTest(err, sfd);
+    //测试sismember命令
+    sismemberCommandTest(err, sfd);
+    //测试smembers命令
+    smembersCommandTest(err, sfd);
+    //测试srem命令
+    sremCommandTest(err, sfd);
+    //测试scard命令
+    scardCommandTest(err, sfd);
+
     //sleep(3600);
 
     exit(EXIT_SUCCESS);

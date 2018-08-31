@@ -116,6 +116,7 @@ struct ledisServer{
     
     int saveparamslen;
     char *logfile;
+    char *bindaddr;
 };
 
 //定义每个ledis命令的实际函数形态
@@ -131,7 +132,7 @@ struct ledisCommand{
 
 //定义会用到的lobj可复用对象
 struct sharedObjectsStruct{
-    lobj *crlf, *ok, *err, *zerobulk, *nil, *zero, *one, *pong;
+    lobj *crlf, *ok, *err, *zerobulk, *nil, *zero, *one, *minus1, *minus2, *minus3, *minus4, *pong;
 } shared;
 
 /*====================================== 函数原型 ===============================*/
@@ -165,6 +166,8 @@ static void delCommand(ledisClient *c);
 static void existsCommand(ledisClient *c);
 static void incrCommand(ledisClient *c);
 static void decrCommand(ledisClient *c);
+static void incrbyCommand(ledisClient *c);
+static void decrbyCommand(ledisClient *c);
 static void selectCommand(ledisClient *c);
 static void randomKeyCommand(ledisClient *c);
 static void lastsaveCommand(ledisClient *c);
@@ -180,41 +183,60 @@ static void lpopCommand(ledisClient *c);
 static void rpopCommand(ledisClient *c);
 static void llenCommand(ledisClient *c);
 static void lindexCommand(ledisClient *c);
+static void lsetCommand(ledisClient *c);
 static void lrangeCommand(ledisClient *c);
 static void ltrimCommand(ledisClient *c);
 
 static void typeCommand(ledisClient *c);
+static void saddCommand(ledisClient *c);
+static void sremCommand(ledisClient *c);
+static void sismemberCommand(ledisClient *c);
+static void scardCommand(ledisClient *c);
+static void sinterCommand(ledisClient *c);
+
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
-    {"ping",pingCommand,1,LEDIS_CMD_INLINE},
-    {"echo",echoCommand,2,LEDIS_CMD_BULK},
-    {"dbsize",dbsizeCommand,1,LEDIS_CMD_INLINE},
-    {"save",saveCommand,1,LEDIS_CMD_INLINE},
-    {"bgsave",bgsaveCommand,1,LEDIS_CMD_INLINE},
     {"set",setCommand,3,LEDIS_CMD_BULK},
     {"setnx",setnxCommand,3,LEDIS_CMD_BULK},
     {"get",getCommand,2,LEDIS_CMD_INLINE},
-    {"keys",keysCommand,2,LEDIS_CMD_INLINE},
     {"del",delCommand,2,LEDIS_CMD_INLINE},
     {"exists",existsCommand,2,LEDIS_CMD_INLINE},
     {"incr",incrCommand,2,LEDIS_CMD_INLINE},
     {"decr",decrCommand,2,LEDIS_CMD_INLINE},
-    {"select",selectCommand,2,LEDIS_CMD_INLINE},
-    {"randomKey",randomKeyCommand,1,LEDIS_CMD_INLINE},
-    {"lastsave",lastsaveCommand,1,LEDIS_CMD_INLINE},
-    {"shutdown",shutdownCommand,1,LEDIS_CMD_INLINE},
-    {"rename",renameCommand,3,LEDIS_CMD_INLINE},
-    {"renamenx",renamenxCommand,3,LEDIS_CMD_INLINE},
-    {"move",moveCommand,3,LEDIS_CMD_INLINE},
     {"lpush",lpushCommand,3,LEDIS_CMD_BULK},
     {"rpush",rpushCommand,3,LEDIS_CMD_BULK},
     {"lpop",lpopCommand,2,LEDIS_CMD_INLINE},
     {"rpop",rpopCommand,2,LEDIS_CMD_INLINE},
     {"llen",llenCommand,2,LEDIS_CMD_INLINE},
     {"lindex",lindexCommand,3,LEDIS_CMD_INLINE},
+    {"lset",lsetCommand,4,LEDIS_CMD_BULK},
     {"lrange",lrangeCommand,4,LEDIS_CMD_INLINE},
     {"ltrim",ltrimCommand,4,LEDIS_CMD_INLINE},
+    
+    {"sadd",saddCommand,3,LEDIS_CMD_BULK},
+    {"srem",sremCommand,3,LEDIS_CMD_BULK},
+    {"sismember",sismemberCommand,3,LEDIS_CMD_BULK},
+    {"scard",scardCommand,2,LEDIS_CMD_INLINE},
+    {"sinter",sinterCommand,-2,LEDIS_CMD_INLINE},
+    {"smembers",sinterCommand,2,LEDIS_CMD_INLINE},
+
+    {"incrby",incrbyCommand,2,LEDIS_CMD_INLINE},
+    {"decrby",decrbyCommand,2,LEDIS_CMD_INLINE},
+
+    {"randomKey",randomKeyCommand,1,LEDIS_CMD_INLINE},
+    {"select",selectCommand,2,LEDIS_CMD_INLINE},
+    {"move",moveCommand,3,LEDIS_CMD_INLINE},
+    {"rename",renameCommand,3,LEDIS_CMD_INLINE},
+    {"renamenx",renamenxCommand,3,LEDIS_CMD_INLINE},
+    {"keys",keysCommand,2,LEDIS_CMD_INLINE},
+    {"dbsize",dbsizeCommand,1,LEDIS_CMD_INLINE},
+    {"ping",pingCommand,1,LEDIS_CMD_INLINE},
+    {"echo",echoCommand,2,LEDIS_CMD_BULK},
+    {"save",saveCommand,1,LEDIS_CMD_INLINE},
+    {"bgsave",bgsaveCommand,1,LEDIS_CMD_INLINE},
+    {"shutdown",shutdownCommand,1,LEDIS_CMD_INLINE},
+    {"lastsave",lastsaveCommand,1,LEDIS_CMD_INLINE},
     {"type",typeCommand,2,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
@@ -556,6 +578,15 @@ static void createSharedObjects(void){
     shared.zero = createObject(LEDIS_STRING, sdsnew("0\r\n"));
     shared.one = createObject(LEDIS_STRING, sdsnew("1\r\n"));
     shared.pong = createObject(LEDIS_STRING, sdsnew("+PONG\r\n"));
+
+    //找不到key
+    shared.minus1 = createObject(LEDIS_STRING, sdsnew("-1\r\n"));
+    //key的type不对
+    shared.minus2 = createObject(LEDIS_STRING, sdsnew("-2\r\n"));
+    //src和dest是一样的
+    shared.minus3 = createObject(LEDIS_STRING, sdsnew("-3\r\n"));
+    //超出范围
+    shared.minus4 = createObject(LEDIS_STRING, sdsnew("-4\r\n"));
 }
 
 /**
@@ -588,6 +619,7 @@ static void initServerConfig(){
     server.maxidletime = LEDIS_MAXIDLETIME;
     server.saveparams = NULL;
     server.logfile = NULL;  //到后面再设定
+    server.bindaddr = NULL;
 
     ResetServerSaveParams();
     //给默认的配置
@@ -614,7 +646,7 @@ static void initServer(){
     if(!server.dict || !server.clients || !server.el || !server.objfreelist){
         oom("server initialization");
     }
-    server.fd = anetTcpServer(server.neterr, server.port, NULL);
+    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
     if(server.fd == -1){
         ledisLog(LEDIS_WARNING, "Opening TCP port: %s", server.neterr);
         exit(EXIT_FAILURE);
@@ -670,6 +702,14 @@ static void loadServerConfig(char *filename){
                 err = "Invalid timeout value";
                 goto loaderr;
             }
+        }else if(!strcmp(argv[0], "port") && argc == 2){
+            server.port = atoi(argv[1]);
+            if(server.port < 1 || server.port > 65535){
+                err = "Invalid port";
+                goto loaderr;
+            }
+        }else if(!strcmp(argv[0], "bindaddr") && argc == 2){
+            server.bindaddr = strdup(argv[1]);
         }else if(!strcmp(argv[0], "save") && argc == 3){
             int seconds = atoi(argv[1]);
             int changes = atoi(argv[2]);
@@ -851,7 +891,7 @@ static int processCommand(ledisClient *c){
         resetClient(c);
         return 1;
     }else if((cmd->arity > 0 && cmd->arity != c->argc) || 
-                (-cmd->arity > c->argc)){    //arity可以是负数了，但也和argc有限制关系
+                (-cmd->arity > c->argc)){    //arity可以是负数了（代表参数必须大于arity），但也和argc有限制关系
         addReplySds(c, sdsnew("-ERR wrong number of arguments\r\n"));
         resetClient(c);
         return 1;
@@ -1442,13 +1482,15 @@ static void setGenericCommand(ledisClient *c, int nx){
             dictReplace(c->dict, c->argv[1], o); 
         }else{  //如果是setnxCommand，则撤销val
             decrRefCount(o);
+            addReply(c, shared.zero);
+            return;
         }
     }else{
         //已经被dict内部指向，要变成裸指针，防止被free
         c->argv[1] = NULL;
     }
     server.dirty++;
-    addReply(c, shared.ok);
+    addReply(c, nx ? shared.one : shared.ok);
 }
 
 static void setCommand(ledisClient *c){
@@ -1466,7 +1508,7 @@ static void getCommand(ledisClient *c){
     }else{
         lobj *o = dictGetEntryVal(de);
         if(o->type != LEDIS_STRING){
-            char *err = "GET against key not holding a string value";
+            char *err = "-ERR GET against key not holding a string value";
             //err是局部的，但sdscatprintf会去复制字符串
             addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
         }else{
@@ -1482,8 +1524,11 @@ static void delCommand(ledisClient *c){
     
     if(dictDelete(c->dict, c->argv[1]) == DICT_OK){
         server.dirty++;
+        addReply(c, shared.ok);
+    }else{
+        addReply(c, shared.zero);
     }
-    addReply(c, shared.ok);
+    
 }
 
 static void existsCommand(ledisClient *c){
@@ -1537,10 +1582,21 @@ static void decrCommand(ledisClient *c){
     incrDecrCommand(c, -1);
 }
 
+static void incrbyCommand(ledisClient *c){
+    int incr = atoi(c->argv[2]);
+    incrDecrCommand(c, incr);
+}
+
+static void decrbyCommand(ledisClient *c){
+    int incr = atoi(c->argv[2]);
+    incrDecrCommand(c, -incr);
+}
+
 static void selectCommand(ledisClient *c){
     int id = atoi(c->argv[1]);
     if(selectDb(c, id) == LEDIS_OK){
         addReply(c, shared.ok);
+        addReply(c, shared.crlf);
     }else{
         addReplySds(c, sdsnew("-ERR invalid DB index\r\n"));    //原版直接返回C字符串，可能有问题，只有sds才能使用sds相关函数
     }
@@ -1595,20 +1651,27 @@ static void shutdownCommand(ledisClient *c){
         ledisLog(LEDIS_WARNING, "Error trying to save the DB, can't exit");
         addReplySds(c, sdsnew("-ERR can't quit, problems saving the DB\r\n"));
     }
-    
 }
 
 static void renameGenericCommand(ledisClient *c, int nx){
     
     //新旧key不能一样
     if(sdscmp(c->argv[1], c->argv[2]) == 0){
-        ledisLog(LEDIS_WARNING, "ERR src and dest are the same\r\n");
+        if(nx){
+            addReply(c, shared.minus3);
+        }else{
+            addReplySds(c, sdsnew("ERR src and dest are the same\r\n"));
+        }
         return;
     }
 
     dictEntry *de = dictFind(c->dict, c->argv[1]);
     if(de == NULL){
-        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        if(nx){
+            addReply(c, shared.minus1);
+        }else{
+            addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        }
         return;
     }
     //取出val
@@ -1619,7 +1682,7 @@ static void renameGenericCommand(ledisClient *c, int nx){
         if(nx){
             //存在key则放弃
             decrRefCount(o);
-            addReplySds(c, sdsnew("-ERR destination key exists"));
+            addReplySds(c, shared.zero);
             return;
         }else{
             dictReplace(c->dict, c->argv[2], o);
@@ -1630,7 +1693,7 @@ static void renameGenericCommand(ledisClient *c, int nx){
     }
     dictDelete(c->dict, c->argv[1]);
     server.dirty++;
-    addReply(c, shared.ok);
+    addReply(c, nx ? shared.one : shared.ok);
 }
 
 static void renameCommand(ledisClient *c){
@@ -1643,20 +1706,20 @@ static void renamenxCommand(ledisClient *c){
 static void moveCommand(ledisClient *c){
     dict *src = c->dict;    //备份指向
     if(selectDb(c, atoi(c->argv[2])) == LEDIS_ERR){
-        addReplySds(c, sdsnew("-ERR target DB out of range\r\n"));
+        addReply(c, shared.minus4);
         return;
     }
     dict *dst = c->dict;    //新的DB指向
     c->dict = src;  //指回去
 
     if(src == dst){ //不能一样
-        addReplySds(c, sdsnew("-ERR source DB is the same as target DB\r\n"));
+        addReply(c, shared.minus3);
         return;
     }
 
     dictEntry *de = dictFind(c->dict, c->argv[1]);
     if(de == NULL){
-        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        addReply(c, shared.zero);
         return;
     }
 
@@ -1664,14 +1727,14 @@ static void moveCommand(ledisClient *c){
     sds *key = dictGetEntryKey(de); //得是指针
     lobj *o = dictGetEntryVal(de);
     if(dictAdd(dst, key, o) == DICT_ERR){
-        addReplySds(c, sdsnew("-ERR target DB already contains the moved key\r\n"));
+        addReply(c, shared.zero);
         return;
     }
 
     //清理src的节点，但是只是移除结构并不能free，只是指向改变了而已
     dictDeleteNoFree(src, c->argv[1]);
     server.dirty++;
-    addReply(c, shared.ok);
+    addReply(c, shared.one);
 }
 
 static void pushGenericCommand(ledisClient *c, int where){
@@ -1727,7 +1790,7 @@ static void popGenericCommand(ledisClient *c, int where){
     }else{
        lobj *o = dictGetEntryVal(de);
        if(o->type != LEDIS_LIST){
-           char *err = "POP against key not holding a list value";
+           char *err = "-ERR POP against key not holding a list value";
            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
        }else{
            list *list = o->ptr;
@@ -1770,7 +1833,7 @@ static void llenCommand(ledisClient *c){
         if(o->type == LEDIS_LIST){
             addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", listLength((list*)o->ptr)));
         }else{
-            addReplySds(c, sdsnew("-1\r\n"));
+            addReply(c, shared.minus2);
             return;
         }
     }
@@ -1799,9 +1862,40 @@ static void lindexCommand(ledisClient *c){
                 return;
             }
         }else{
-            char *err = "LINDEX against key not holding a list value";
+            char *err = "-ERR LINDEX against key not holding a list value";
             addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
             return;
+        }
+    }
+}
+
+static void lsetCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    int index = atoi(c->argv[2]);
+    if(de == NULL){
+        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type != LEDIS_LIST){
+            addReplySds(c, sdsnew("-ERR LSET against key not holding a list value\r\n"));
+            return;
+        }else{
+            //是list就可以尝试set了
+            list *list = o->ptr;
+            listNode *ln = listIndex(list, index);
+            if(ln == NULL){
+                addReplySds(c, sdsnew("-ERR index out of range\r\n"));
+                return;
+            }else{
+                lobj *ele = listNodeValue(ln);
+                decrRefCount(ele);  //删除原来的
+                listNodeValue(ln) = createObject(LEDIS_STRING, c->argv[3]);
+                c->argv[3] = NULL;  //裸指针避免被free
+                addReply(c, shared.ok);
+                server.dirty++;
+                return;
+            }
         }
     }
 }
@@ -1846,7 +1940,7 @@ static void lrangeCommand(ledisClient *c){
             }
             return;
         }else{
-            char *err = "LRANGE against key not holding a list value";
+            char *err = "-ERR LRANGE against key not holding a list value";
             addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
             return;
         }
@@ -1891,6 +1985,7 @@ static void ltrimCommand(ledisClient *c){
                 listDelNode(list, node);
             }
             addReply(c, shared.ok);
+            server.dirty++; //只算一次变动
             return;
         }else{
             addReplySds(c, sdsnew("-ERR LTRIM against key not holding a list value"));
@@ -1918,6 +2013,171 @@ static void typeCommand(ledisClient *c){
     addReply(c, shared.crlf);
 }
 
+static void saddCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    lobj *set;
+    if(de == NULL){
+        //没有这个key则新增，val为SET类型的obj
+        set = createSetObject();
+        dictAdd(c->dict, c->argv[1], set);  //find过了所以肯定成功
+        c->argv[1] = 0; //？就是NULL啊
+    }else{
+        //已经有key了，则追加
+        set = dictGetEntryVal(de);
+        if(set->type != LEDIS_SET){
+            addReply(c, shared.minus2);
+            return;
+        }
+    }
+    //只是处理好了set本身，还要处理set里面dict的key们
+    lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
+    c->argv[2] = NULL;
+    if(dictAdd(set->ptr, ele, NULL) == DICT_OK){
+        server.dirty++;
+        addReply(c, shared.one);
+        return;
+    }else{
+        decrRefCount(ele);  //再删了
+        addReply(c, shared.zero);
+        return;
+    }
+}
+
+static void sremCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+        return;
+    }else{
+        lobj *set = dictGetEntryVal(de);
+        if(set->type != LEDIS_SET){
+            addReply(c, shared.minus2);
+            return;
+        }else{
+            //尝试删除里面dict的key（也就是单个元素）
+            lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
+            if(dictDelete(set->ptr, ele) == DICT_OK){
+                server.dirty++;
+                addReply(c, shared.one);
+            }else{
+                addReply(c, shared.zero);
+            }
+            //清理
+            ele->ptr = NULL;    //有啥用
+            decrRefCount(ele);
+            return;
+        }
+    }
+}
+
+static void sismemberCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+        return;
+    }else{
+        lobj *set = dictGetEntryVal(de);
+        if(set->type != LEDIS_SET){
+            addReply(c, shared.minus2);
+            return;
+        }else{
+            //查找
+            lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
+            if(dictFind(set->ptr, ele)){
+                addReply(c, shared.one);
+            }else{
+                addReply(c, shared.zero);
+            }
+            ele->ptr = NULL;
+            decrRefCount(ele);
+            return;
+        }
+    }
+}
+
+static void scardCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+        return;
+    }else{
+        lobj *set = dictGetEntryVal(de);
+        if(set->type != LEDIS_SET){
+            addReply(c, shared.minus2);
+            return;
+        }
+        dict *s = set->ptr;
+        addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", dictGetHashTableUsed(s)));
+        return;
+    }
+}
+
+static int qsortCompareSetsByCardinality(const void *s1, const void *s2){
+    //注意s1和s2必须是指针，所以要多一层
+    dict **d1 = (void *)s1;
+    dict **d2 = (void *)s2;
+    return dictGetHashTableUsed(*d1) - dictGetHashTableUsed(*d2);
+}
+
+/**
+ * 取不同SET的交集，因此c->argc至少要为3
+ * 此command还兼容smember命令，即只传一个SET的KEY，让取交集的for直接跳过，从此造成交集等于自身SET的情况，并依次返回
+ */ 
+static void sinterCommand(ledisClient *c){
+    dict **dv = malloc(sizeof(dict*)*(c->argc-1));
+    if(!dv) oom("sinterCommand");
+    //尝试处理参数传来的每个SET
+    for(int i = 0; i < c->argc-1; i++){
+        dictEntry *de = dictFind(c->dict, c->argv[i+1]);
+        if(de == NULL){ //每个key参数必须要有效
+            free(dv);
+            addReply(c, shared.nil);
+            return;
+        }
+        lobj *setobj = dictGetEntryVal(de);
+        if(setobj->type != LEDIS_SET){
+            free(dv);
+            char *err = "-ERR LINTER against key not holding a set value";
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+            return;
+        }
+        dv[i] = setobj->ptr;
+    }
+
+    //开始处理dict数组中的每个dict了
+    qsort(dv, c->argc-1, sizeof(dict*), qsortCompareSetsByCardinality); //将dv里面的dict按总量排序
+    //返回类型为multi-bulk，但是现在还不知道SET最终交集的数目，所以先输出一个空字符串，在最后会修改实际值
+    lobj *lenobj = createObject(LEDIS_STRING, NULL);
+    addReply(c, lenobj);
+    decrRefCount(lenobj);
+    //开始迭代最小的SET，测试每一个在其他SET里面是否存在即可，有一个不在就不算
+    dictIterator *di = dictGetIterator(dv[0]);
+    if(!di) oom("dictGetIterator");
+
+    dictEntry *de;
+    int cardinality = 0;
+    while((de = dictNext(di)) != NULL){
+        lobj *ele;
+        int j;
+        //从dv的第2个元素开始比
+        for(j = 1; j < c->argc-1; j++){
+            //没找到直接退出for
+            if(dictFind(dv[j], dictGetEntryKey(de)) == NULL) break;
+        }
+        if(j != c->argc-1) continue;    //如果不是最后一个SET，说明for是被break出来的，不是后面SET都有这个元素，换下一个元素尝试
+        ele = dictGetEntryKey(de);
+        addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", sdslen(ele->ptr)));
+        addReply(c, ele);
+        addReply(c, shared.crlf);
+        cardinality++;
+    }
+
+    //因为是单线程的，所以向客户端write的操作要等到下一轮ae迭代了
+    lenobj->ptr = sdscatprintf(sdsempty(), "%d\r\n", cardinality);  
+    dictReleaseIterator(di);
+    free(dv);
+}
+
 /*====================================== 主函数 ===============================*/
 
 int main(int argc, char *argv[]){
@@ -1926,8 +2186,6 @@ int main(int argc, char *argv[]){
     LEDIS_NOTUSED(argv);
     //初始化server配置
     initServerConfig();
-    //初始化server
-    initServer();
     if(argc == 2){  //制定了conf文件
         ResetServerSaveParams();    //清空saveparams字段
         loadServerConfig(argv[1]);
@@ -1936,6 +2194,8 @@ int main(int argc, char *argv[]){
         fprintf(stderr, "Usage: ./ledis-server [/path/to/ledis.conf]\n");
         exit(EXIT_FAILURE);
     }
+    //初始化server
+    initServer();
     ledisLog(LEDIS_NOTICE, "Server started");
     //尝试恢复数据库dump.ldb文件
     if(loadDb("dump.ldb") == LEDIS_OK){
