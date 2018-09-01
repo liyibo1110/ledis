@@ -98,10 +98,12 @@ int anetSetSendBuffer(char *err, int fd, int bufferSize){
     return ANET_OK;
 }
 
+#define ANET_CONNECT_NONE 0
+#define ANET_CONNECT_NONBLOCK 1
 /**
  * 连接给定的addr和port端口，用的是新版的API重写，而不是redis自己默认的老版本
  */ 
-int anetTcpConnect(char *err, char *addr, int port){
+int anetTcpGenericConnect(char *err, char *addr, int port, int flags){
 
     //初始化
     struct addrinfo hints;
@@ -125,11 +127,23 @@ int anetTcpConnect(char *err, char *addr, int port){
     }
 
     int sfd;
+    int on = 1;
     //开始循环遍历结果，最终确定socket的描述符
     for(rp = result; rp != NULL; rp = rp->ai_next){
         sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if(sfd == -1)   continue;
-        if(connect(sfd, rp->ai_addr, rp->ai_addrlen) != -1) break;  //找到了就不用再找了
+        
+        //针对benckmark这类快速开关连接的client，需要设计REUSEADDR标记
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        if(flags & ANET_CONNECT_NONBLOCK){
+            if(anetNonBlock(err, s) != ANET_OK) return ANET_ERR;
+        }
+
+        if(connect(sfd, rp->ai_addr, rp->ai_addrlen) != -1){
+            break;  //找到了就不用再找了
+        }else if(errno == EINPROGRESS && flags & ANET_CONNECT_NONBLOCK){    //也可以
+            break;
+        }
         //不成功还得关闭
         close(sfd);
     }
@@ -141,6 +155,14 @@ int anetTcpConnect(char *err, char *addr, int port){
     }
 
     return sfd;
+}
+
+int anetTcpConnect(char *err, char *addr, int port){
+    return anetTcpGenericConnect(err, addr, port, ANET_CONNECT_NONE);
+}
+
+int anetTcpNonBlockConnect(char *err, char *addr, int port){
+    return anetTcpGenericConnect(err, addr, port, ANET_CONNECT_NONBLOCK);
 }
 
 /**
@@ -201,7 +223,7 @@ int anetTcpServer(char *err, int port, char *bindaddr){
     }
 
     //最后开始监听
-    if(listen(sfd, 5) == -1){
+    if(listen(sfd, 32) == -1){
         anetSetError(err, "listen: %s\n", strerror(errno));
         close(sfd);
         return ANET_ERR;

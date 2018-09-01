@@ -90,6 +90,7 @@ void dictReleaseIterator(dictIterator *iter);
 dictEntry *dictGetRandomKey(dict *ht);
 void dictPrintStats(dict *ht);
 unsigned int dictGenHashFunction(const unsigned char *buf, int len);    //未知
+void dictEmpty(dict *ht);
 
 /*---------------------定义3种type--------------------*/
 extern dictType dictTypeHeapStringCopyKey;

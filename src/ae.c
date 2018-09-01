@@ -320,6 +320,34 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
 }
 
 /**
+ * 尝试调用一次select轮询，查看给定的单个fd是否就绪，timeout参数由传入的时间参数指定
+ */ 
+int aeWait(int fd, int mask, long long milliseconds){
+    
+    struct timeval tv;
+    tv.tv_sec = milliseconds/1000;
+    tv.tv_usec = (milliseconds%1000)*1000;
+
+    fd_set rfds, wfds, efds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+    if(mask & AE_READABLE) FD_SET(fd, &rfds);
+    if(mask & AE_WRITABLE) FD_SET(fd, &wfds);
+    if(mask & AE_EXCEPTION) FD_SET(fd, &efds);
+    int retmask = 0, retval;
+    if((retval = select(fd+1, &rfds, &wfds, &efds, &tv)) > 0){
+        //这个fd有就绪的
+        if(FD_ISSET(fd, &rfds)) retmask |= AE_READABLE;
+        if(FD_ISSET(fd, &wfds)) retmask |= AE_WRITABLE;
+        if(FD_ISSET(fd, &efds)) retmask |= AE_EXCEPTION;
+        return retmask;
+    }else{
+        return retval;  //没就绪就是0,负数说明出错了
+    }
+}
+
+/**
  * 启动一个event容器，循环执行直到stop置位
  */ 
 void aeMain(aeEventLoop *eventLoop){

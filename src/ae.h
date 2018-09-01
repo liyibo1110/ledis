@@ -69,6 +69,7 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long milliseconds,
 int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id);
 
 int aeProcessEvents(aeEventLoop *evnetLoop, int flags);
+int aeWait(int fd, int mask, long long milliseconds);
 void aeMain(aeEventLoop *eventLoop);
 
 #endif
