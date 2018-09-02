@@ -12,6 +12,9 @@ beta-6变化
 2.anetTcpServer的backlog参数由5提高到32。
 3.dict增加了dictEmpty函数，即清空并析构指定的dict（内部原来就有实现，只是未公开）。
 4.ae增加了aeWait函数，指定fd使用select系统调用查看是否就绪，并可以传入timeout。
+5.ledis增加了hash新类型，增加了obj池子的最大数目限制。
+6.client结构的argv字段，类型由字符串数组，改成obj指针的数组。
+7.精简了hash相关实现，无论是key还是val，以后都是obj形式封装，不会再直接是sds。
 
 beta-5变化
 代码调整：

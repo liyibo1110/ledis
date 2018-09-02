@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -8,8 +7,9 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdbool.h>
-
 #include <time.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -34,6 +34,8 @@
 #define LEDIS_MAX_ARGS  16
 #define LEDIS_DEFAULT_DBNUM 16  //默认db数目
 #define LEDIS_CONFIGLINE_MAX    1024    //1k
+#define LEDIS_OBJFREELIST_MAX 10000 //obj池子最大数目
+#define LEDIS_MAX_SYNC_TIME 60 //
 
 /*========== Hash table 相关==========*/
 #define LEDIS_HT_MINFILL    10  //dict实际占用百分数，小于这个比率就会尝试再收缩（前提是扩张过）
@@ -46,14 +48,25 @@
 
 /*========== 命令类型 ==========*/
 #define LEDIS_CMD_BULK  1
-#define LEDIS_CMD_INLINE    0
+#define LEDIS_CMD_INLINE    2
 
 /*========== 对象类型 ==========*/
 #define LEDIS_STRING    0
 #define LEDIS_LIST  1
 #define LEDIS_SET   2
+#define LEDIS_HASH  3
 #define LEDIS_SELECTDB  254
 #define LEDIS_EOF   255
+
+/*========== 客户端flags ==========*/
+#define LEDIS_CLOSE 1 //客户端是普通端，用完直接关闭
+#define LEDIS_SLAVE 2 //客户端是个从服务端
+#define LEDIS_MASTER 4 //客户端是个主服务端（应该用不到）
+
+/*========== 服务端主从状态 ==========*/
+#define LEDIS_REPL_NONE 0 //没有活动的主从
+#define LEDIS_REPL_CONNECT 1 //必须要连主
+#define LEDIS_REPL_CONNECTED 2 //已连上主
 
 /*========== list相关 ==========*/
 #define LEDIS_HEAD  0   //链表遍历方向
@@ -68,18 +81,6 @@
 #define LEDIS_NOTUSED(V) ((void) V)
 
 /*========== 定义数据结构 ==========*/
-//客户端封装
-typedef struct ledisClient{
-    int fd;
-    dict *dict;
-    sds querybuf;
-    sds argv[LEDIS_MAX_ARGS];
-    int argc;
-    int bulklen;
-    list *reply;
-    int sentlen;
-    time_t lastinteraction; //上一次交互的时间点
-} ledisClient;
 
 //对象封装，可以是string/list/set
 typedef struct ledisObject{
@@ -87,6 +88,22 @@ typedef struct ledisObject{
     void *ptr;
     int refcount;
 } lobj;
+
+//客户端封装
+typedef struct ledisClient{
+    int fd;
+    dict *dict;
+    int dictid;
+    sds querybuf;
+    lobj *argv[LEDIS_MAX_ARGS];
+    int argc;
+    int bulklen;
+    list *reply;
+    int sentlen;
+    time_t lastinteraction; //上一次交互的时间点
+    int flags; //LEDIS_CLOSE或者LEDIS_SLAVE
+    int slaveseldb; //如果client是从服务端，则代表自己的dbid
+} ledisClient;
 
 //封装save功能的参数，只有一个，所以不需要typedef
 struct saveparam{  
@@ -101,10 +118,12 @@ struct ledisServer{
     dict **dict;    //内存存储的指针数组，和dbnum相关，即默认16个元素
     long long dirty;    //自从上次save后经历的变更数
     list *clients;  //客户端链表
+    list *slaves;   //从服务端链表
 
     char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
     int verbosity;  //log的输出等级
+    int glueoutputbuf;
     int cronloops;
     int maxidletime;
 
@@ -117,6 +136,13 @@ struct ledisServer{
     int saveparamslen;
     char *logfile;
     char *bindaddr;
+
+    //主从相关
+    int isslave;
+    char *masterhost;
+    int masterport;
+    ledisClient *master;
+    int replstate;
 };
 
 //定义每个ledis命令的实际函数形态
@@ -127,12 +153,16 @@ struct ledisCommand{
     char *name;
     ledisCommandProc *proc;
     int arity;
-    int type;   //是块类命令，还是内联命令
+    int flags;   //是块类命令，还是内联命令
 };
 
 //定义会用到的lobj可复用对象
 struct sharedObjectsStruct{
-    lobj *crlf, *ok, *err, *zerobulk, *nil, *zero, *one, *minus1, *minus2, *minus3, *minus4, *pong;
+    lobj *crlf, *ok, *err, *zerobulk, *nil, *zero, *one, *pong, *space,
+    *minus1, *minus2, *minus3, *minus4,
+    *wrongtypeerr, *nokeyerr, *wrongtypeerrbulk, *nokeyerrbulk,
+    *select0, *select1, *select2, *select3, *select4,
+    *select5, *select6, *select7, *select8, *select9;
 } shared;
 
 /*====================================== 函数原型 ===============================*/
@@ -150,6 +180,8 @@ static void addReply(ledisClient *c, lobj *obj);
 static void addReplySds(ledisClient *c, sds s);
 
 static int saveDbBackground(char *filename);
+static lobj *createStringObject(char *ptr, size_t len);
+static int syncWithMaster(void);    //和主同步
 
 //所有函数均只在本文件被调用
 static void pingCommand(ledisClient *c);
@@ -412,62 +444,53 @@ static void oom(const char *msg){
 }
 
 /*====================================== Hash table类型实现 ===============================*/
-//这套dicttype，用作key只能为sds动态字符串，val只能为lobj的dict结构（val具体可为sds, lists, sets）
-static unsigned int sdsDictHashFunction(const void *key){
-    return dictGenHashFunction(key, sdslen((sds)key));
-}
 
 /**
  * 完全一样则返回1,否则返回0
  */ 
-static int sdsDictKeyCompare(void *privdata, const void *key1, const void *key2){
+/* static int sdsDictKeyCompare(void *privdata, const void *key1, const void *key2){
     
     DICT_NOTUSED(privdata);
     int l1 = sdslen((sds)key1);
     int l2 = sdslen((sds)key2);
     if(l1 != l2)    return 0;
     return memcmp(key1, key2, l1) == 0;
-}
+} */
 
-static void sdsDictKeyDestructor(void *privdata, void *key){
-    DICT_NOTUSED(privdata);
-    sdsfree(key);
-}
-
-static void sdsDictValDestructor(void *privdata, void *val){
+static void dictLedisObjectDestructor(void *privdata, void *val){
     DICT_NOTUSED(privdata);
     decrRefCount(val);
 }
 
-dictType sdsDictType = {
-    sdsDictHashFunction,    //hash函数
-    NULL,                   //keyDup函数
-    NULL,                   //valDup函数
-    sdsDictKeyCompare,      //keyCompare函数
-    sdsDictKeyDestructor,   //key清理函数
-    sdsDictValDestructor,   //val清理函数
-};
-
 /**
  * set类型里面的dict，key为lobj对象，type是sds
  */ 
-static unsigned int setDictHashFunction(const void *key){
+static unsigned int dictSdsHash(const void *key){
     const lobj *o = key;
     return dictGenHashFunction(o->ptr, sdslen((sds)o->ptr));
 }
 
-static int setDictKeyCompare(void *privdata, const void *key1, const void *key2){
+static int dictSdsKeyCompare(void *privdata, const void *key1, const void *key2){
     const lobj *o1 = key1;
     const lobj *o2 = key2;
     return sdsDictKeyCompare(privdata, o1->ptr, o2->ptr);
 }
 
-dictType setDictType = {
-    setDictHashFunction,    //hash函数
+dictType hashDictType = {
+    dictSdsHash,    //hash函数
     NULL,                   //keyDup函数
     NULL,                   //valDup函数
-    setDictKeyCompare,      //keyCompare函数
-    sdsDictKeyDestructor,   //key清理函数（看不懂，怎么又sds了）
+    dictSdsKeyCompare,      //keyCompare函数
+    dictLedisObjectDestructor,   //key清理函数
+    dictLedisObjectDestructor,   //val清理函数
+};
+
+dictType setDictType = {
+    dictSdsHash,    //hash函数
+    NULL,                   //keyDup函数
+    NULL,                   //valDup函数
+    dictSdsKeyCompare,      //keyCompare函数
+    dictLedisObjectDestructor,   //key清理函数（看不懂，怎么又sds了）
     NULL,   //val清理函数（压根就没有val）
 };
 
@@ -484,8 +507,8 @@ void closeTimedoutClients(void){
     ledisClient *c;
     while((ln = listNextElement(li)) != NULL){
         c = listNodeValue(ln);
-        //检查上次交互的时间
-        if(now - c->lastinteraction > server.maxidletime){
+        //检查上次交互的时间，slave客户端没有timeout
+        if(!(c->flags & LEDIS_SLAVE) && now - c->lastinteraction > server.maxidletime){
             ledisLog(LEDIS_DEBUG, "Closing idle client");
             //关闭client
             freeClient(c);
@@ -526,7 +549,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
 
     //差不多每10秒，尝试清理超时的client
     if(!(loops % 5)){
-        ledisLog(LEDIS_DEBUG, "%d clients connected", listLength(server.clients));
+        ledisLog(LEDIS_DEBUG, "%d clients connected (%d slaves)", listLength(server.clients), listLength(server.slaves));
     }
 
     if(!(loops % 10)){
@@ -563,6 +586,14 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
         }
     }
 
+    //如果是从服务端，还要检查与主的同步
+    if(server.replstate == LEDIS_REPL_CONNECT){
+        ledisLog(LEDIS_NOTICE, "Connecting to MASTER...");
+        if(syncWithMaster() == LEDIS_OK){
+            ledisLog(LEDIS_NOTICE, "MASTER <-> SLAVE sync succeeded");
+        }
+    }
+
     return 1000;
 }
 
@@ -587,6 +618,23 @@ static void createSharedObjects(void){
     shared.minus3 = createObject(LEDIS_STRING, sdsnew("-3\r\n"));
     //超出范围
     shared.minus4 = createObject(LEDIS_STRING, sdsnew("-4\r\n"));
+
+    shared.wrongtypeerr = createObject(LEDIS_STRING, sdsnew("-ERR Operation against a key holding the wrong kind of value\r\n"));
+    shared.wrongtypeerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty, "%d\r\n%s", -sdslen(shared.wrongtypeerr->ptr)+2, shared.wrongtypeerr->ptr));
+    shared.nokeyerr = createObject(LEDIS_STRING, sdsnew("-ERR no such key\r\n"));
+    shared.nokeyerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty, "%d\r\n%s", -sdslen(shared.nokeyerr->ptr)+2, shared.nokeyerr->ptr));
+
+    shared.space = createObject(LEDIS_STRING, sdsnew(" "));
+    shared.select0 = createStringObject("select 0\r\n", 10);
+    shared.select1 = createStringObject("select 1\r\n", 10);
+    shared.select2 = createStringObject("select 2\r\n", 10);
+    shared.select3 = createStringObject("select 3\r\n", 10);
+    shared.select4 = createStringObject("select 4\r\n", 10);
+    shared.select5 = createStringObject("select 5\r\n", 10);
+    shared.select6 = createStringObject("select 6\r\n", 10);
+    shared.select7 = createStringObject("select 7\r\n", 10);
+    shared.select8 = createStringObject("select 8\r\n", 10);
+    shared.select9 = createStringObject("select 9\r\n", 10);
 }
 
 /**
@@ -620,12 +668,19 @@ static void initServerConfig(){
     server.saveparams = NULL;
     server.logfile = NULL;  //到后面再设定
     server.bindaddr = NULL;
+    server.glueoutputbuf = 1;
 
     ResetServerSaveParams();
     //给默认的配置
     appendServerSaveParams(60*60, 1);   //1小时后要达到1次变动即save
     appendServerSaveParams(300, 100);   //5分钟后要达到100次变动即save
     appendServerSaveParams(60, 10000);  //1分钟后要达到10000次变动即save
+    //主从相关配置
+    server.isslave = 0;
+    server.masterhost = NULL;
+    server.masterport = 6379;
+    server.master = NULL;
+    server.replstate = LEDIS_REPL_NONE;
 }
 
 /**
@@ -638,12 +693,13 @@ static void initServer(){
     signal(SIGPIPE, SIG_IGN);
 
     server.clients = listCreate();
+    server.slaves = listCreate();
     server.objfreelist = listCreate();
     createSharedObjects();
     server.el = aeCreateEventLoop();
     //初始化dict数组，只是分配了dbnum个地址空间，并没有为实际dict结构分配内存
     server.dict = malloc(sizeof(dict*)*server.dbnum);
-    if(!server.dict || !server.clients || !server.el || !server.objfreelist){
+    if(!server.dict || !server.clients || !server.slaves || !server.el || !server.objfreelist){
         oom("server initialization");
     }
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
@@ -654,9 +710,9 @@ static void initServer(){
     printf("server.fd=%d\n", server.fd);
     //继续给dict数组内部真实分配
     for(int i = 0; i < server.dbnum; i++){
-        server.dict[i] = dictCreate(&sdsDictType, NULL);
+        server.dict[i] = dictCreate(&hashDictType, NULL);
         if(!server.dict[i]){
-            oom("server initialization");
+            oom("dictCreate");
         }
     }
     server.cronloops = 0;
@@ -664,6 +720,15 @@ static void initServer(){
     server.lastsave = time(NULL);
     server.dirty = 0;
     aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
+}
+
+/**
+ * 清空server的所有dict
+ */ 
+static void emptyDb(){
+    for(int i = 0; i < server.dbnum; i++){
+        dictEmpty(server.dict[i]);
+    }
 }
 
 /**
@@ -693,7 +758,9 @@ static void loadServerConfig(char *filename){
             sdsfree(line);
             continue;
         }
+        //argv要free
         argv = sdssplitlen(line, sdslen(line), " ", 1, &argc);
+        sdstolower(argv[0]);
 
         //开始实施这一行的配置
         if(!strcmp(argv[0], "timeout") && argc == 2){
@@ -736,7 +803,10 @@ static void loadServerConfig(char *filename){
             }
         }else if(!strcmp(argv[0], "logfile") && argc == 2){
             server.logfile = strdup(argv[1]);   //需要复制字符串，因为argv是函数范围
-            if(!strcmp(server.logfile, "stdout"))   server.logfile = NULL;
+            if(!strcmp(server.logfile, "stdout")){
+                free(server.logfile);
+                server.logfile = NULL;
+            }
             if(server.logfile){
                 //如果不是stdout，则需要在这里测试一下文件的可读写性
                 FILE *fp = fopen(server.logfile, "a");
@@ -755,9 +825,29 @@ static void loadServerConfig(char *filename){
                 err = "Invalid number of databases";
                 goto loaderr;
             }
-        }else{
+        }else if(!strcmp(argv[0], "slaveof") && argc ==3){
+            server.masterhost = sdsnew(argv[1]);
+            server.masterport = atoi(argv[2]);
+            server.replstate = LEDIS_REPL_CONNECT;  //说明是从
+        }else if(!strcmp(argv[0], "glueoutputbuf") && argc == 2){
+            sdstolower(argv[1]);
+            if(!strcmp(argv[1], "yes")){
+                server.glueoutputbuf = 1;
+            }else if(!strcmp(argv[1], "no")){
+                server.glueoutputbuf = 0;
+            }else{
+                err = "argument must be 'yes' or 'no'";
+                goto loaderr;
+            }
+        }
+        
+        else{
             err = "Bad directive or wrong number of arguments";
             goto loaderr;
+        }
+        //追加清理argv
+        for(int i = 0; i < argc; i++){
+            sdsfree(argv[i]);
         }
         sdsfree(line);
     }
@@ -778,7 +868,7 @@ loaderr:{
  */ 
 static void freeClientArgv(ledisClient *c){
     for(int i = 0; i < c->argc; i++){
-        sdsfree(c->argv[i]);
+        decrRefCount(c->argv[i]);
     }
     c->argc = 0;
 }
@@ -800,6 +890,16 @@ static void freeClient(ledisClient *c){
     listNode *ln = listSearchKey(server.clients, c);
     assert(ln != NULL);
     listDelNode(server.clients, ln);
+    if(c->flags & LEDIS_SLAVE){
+        ln = listSearchKey(server.slaves, c);
+        assert(ln != NULL);
+        listDelNode(server.slaves, ln);
+    }
+    //如果客户端是主服务端反向连接过来的
+    if(c->flags & LEDIS_MASTER){
+        server.master = NULL;
+        server.replstate = LEDIS_REPL_CONNECT;
+    }
     free(c);
 }
 
