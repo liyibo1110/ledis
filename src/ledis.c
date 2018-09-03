@@ -181,6 +181,7 @@ static void addReplySds(ledisClient *c, sds s);
 
 static int saveDbBackground(char *filename);
 static lobj *createStringObject(char *ptr, size_t len);
+static void replicationFeedSlaves(struct ledisCommand *cmd, int dictid, lobj **argv, int argc);
 static int syncWithMaster(void);    //和主同步
 
 //所有函数均只在本文件被调用
@@ -903,6 +904,38 @@ static void freeClient(ledisClient *c){
     free(c);
 }
 
+/**
+ * 将client的reply链表统一输出
+ */ 
+static void glueReplyBuffersIfNeeded(ledisClient *c){
+
+    listNode *ln = c->reply->head;
+    lobj *o;
+    int totlen = 0;
+    while(ln){
+        o = ln->value;
+        totlen += sdslen(o->ptr);
+        ln = ln->next;
+        if(totlen > 1024) return;   //写死了
+    }
+    //开始发送
+    if(totlen > 0){
+        char buf[1024];
+        int copylen = 0;
+        listNode *next;
+        ln = c->reply->head;
+        while(ln){
+            next = ln->next;
+            o = ln->value;
+            memcpy(buf+copylen, o->ptr, sdslen(o->ptr));
+            copylen += sdslen(o->ptr);
+            listDelNode(c->reply, ln);
+            ln = ln->next;
+        }
+        addReplySds(c, sdsnewlen(buf, totlen));
+    }
+}
+
 static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask){
 
     LEDIS_NOTUSED(el);
@@ -911,6 +944,12 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
     ledisClient *c = privdata;
     int nwritten = 0, totwritten = 0, objlen;
     lobj *o;
+   
+    //先尝试glue整体输出
+    if(server.glueoutputbuf && listLength(c->reply) > 1){
+        glueReplyBuffersIfNeeded(c);
+    }
+
     while(listLength(c->reply)){
         o = listNodeValue(listFirst(c->reply));
         objlen = sdslen(o->ptr);    //实际字符串长度
@@ -919,10 +958,14 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
             continue;
         }
 
-        //开始写入client，分段写入，并没有用到anet.c里面的anetWrite函数
-        nwritten = write(fd, o->ptr + c->sentlen, objlen - c->sentlen);
-        printf("nwritten=%d\n", nwritten);
-        if(nwritten <= 0)   break;
+        if(c->flags & LEDIS_MASTER){    //如果是主服务端反向来的，不真返回只模拟，因为主库不需要这些消息
+            nwritten = objlen - c->sentlen;
+        }else{
+            //开始写入client，分段写入，并没有用到anet.c里面的anetWrite函数
+            nwritten = write(fd, o->ptr + c->sentlen, objlen - c->sentlen);
+            printf("nwritten=%d\n", nwritten);
+            if(nwritten <= 0)   break;
+        }
         c->sentlen += nwritten;
         totwritten += nwritten;
         //检查是否写完了，可能因为网络或者client问题，造成部分写入，则进入新的循环再写剩下的（sentlen保存了已写的字节数）
@@ -979,12 +1022,12 @@ static int processCommand(ledisClient *c){
 
     //sdstolower(c->argv[0]);
 
-    if(!strcmp(c->argv[0], "quit")){
+    if(!strcmp(c->argv[0]->ptr, "quit")){
         freeClient(c);
         return 0;
     }
 
-    struct ledisCommand *cmd = lookupCommand(c->argv[0]);
+    struct ledisCommand *cmd = lookupCommand(c->argv[0]->ptr);
 
     if(!cmd){
         addReplySds(c, sdsnew("-ERR unknown command\r\n"));
@@ -995,24 +1038,22 @@ static int processCommand(ledisClient *c){
         addReplySds(c, sdsnew("-ERR wrong number of arguments\r\n"));
         resetClient(c);
         return 1;
-    }else if(cmd->type == LEDIS_CMD_BULK && c->bulklen == -1){
-        int bulklen = atoi(c->argv[c->argc-1]); //获取后面bulk数据的长度
-        sdsfree(c->argv[c->argc-1]);    //转成int原来的就没用了
+    }else if(cmd->flags == LEDIS_CMD_BULK && c->bulklen == -1){
+        int bulklen = atoi(c->argv[c->argc-1]->ptr); //获取后面bulk数据的长度
+        decrRefCount(c->argv[c->argc-1]);    //转成int原来的就没用了
         if(bulklen < 0 || bulklen > 1024*1024*1024){
             c->argc--;
-            c->argv[c->argc] = NULL;
             addReplySds(c, sdsnew("-ERR invalid bulk write count\r\n"));
             resetClient(c);
             return 1;
         }
         //清理
-        c->argv[c->argc-1] = NULL;
         c->argc--;
         c->bulklen = bulklen + 2;   //bulk数据后面还有\r\n要计算，解析时会被跳过
         //检查querybuf里有没有bulk数据，这个不一定有，没有则要退回readQueryFromClient的again中
         if((signed)sdslen(c->querybuf) >= c->bulklen){
             //有则填充最后一个argv，用真正的bulk参数
-            c->argv[c->argc] = sdsnewlen(c->querybuf, c->bulklen - 2);  //bulk实际数据不包括\r\n
+            c->argv[c->argc] = createStringObject(c->querybuf, c->bulklen - 2);  //bulk实际数据不包括\r\n
             c->argc++;
             c->querybuf = sdsrange(c->querybuf, c->bulklen, -1);    //包括bulk数据和\r\n一起跳过
         }else{
@@ -1020,9 +1061,71 @@ static int processCommand(ledisClient *c){
         }
     }
     //运行命令，可是inline的，也可以是bulk类型的
+    long long dirty = server.dirty;
     cmd->proc(c);
+    //如果配置了从，而且cmd发生了数据变动，则触发从同步
+    if(server.dirty - dirty != 0 && listLength(server.slaves)){
+        replicationFeedSlaves(cmd, c->dictid, c->argv, c->argc);
+    }
+    //如果是普通类型，用完一次就彻底清理，不需要等待内置timeout了，也不用reset了
+    if(c->flags & LEDIS_CLOSE){
+        freeClient(c);
+        return 0;
+    }
     resetClient(c);
     return 1;
+}
+
+/**
+ * 在主库运行cmd之后尝试触发
+ */ 
+static void replicationFeedSlaves(struct ledisCommand *cmd, int dictid, lobj **argv, int argc){
+    listNode *ln = server.slaves->head;
+    lobj *outv[LEDIS_MAX_ARGS*4];
+    int outc = 0;
+    //将argv的obj数组，放到outv数组里面，用空格分开，注意每个元素（空格，换行符）都是一个单独的obj元素
+    for(int i = 0; i < argc; i++){
+        if(i != 0) outv[outc++] = shared.space;
+        if((cmd->flags & LEDIS_CMD_BULK) && i == argc-1){   //特殊处理bulk类型
+            lobj *lenobj = createObject(LEDIS_STRING, sdscatprinf(sdsempty(), "%d\r\n", sdslen(argv[i]->ptr)));
+            lenobj->refcount = 0;   //要干啥
+            outv[outc++] = lenobj;
+        }
+        outv[outc++] = argv[i];
+    }
+    outv[outc++] = shared.crlf;
+
+    while(ln){
+        ledisClient *slave = ln->value; //不用宏了？
+        if(slave->slaveseldb != dictid){    //先尝试让从切到和主一致的库
+            lobj *selectcmd;
+            switch(dictid){
+                //只是为了快
+                case 0: selectcmd = shared.select0; break;
+                case 1: selectcmd = shared.select1; break;
+                case 2: selectcmd = shared.select2; break;
+                case 3: selectcmd = shared.select3; break;
+                case 4: selectcmd = shared.select4; break;
+                case 5: selectcmd = shared.select5; break;
+                case 6: selectcmd = shared.select6; break;
+                case 7: selectcmd = shared.select7; break;
+                case 8: selectcmd = shared.select8; break;
+                case 9: selectcmd = shared.select9; break;
+                default:{
+                    selectcmd = createObject(LEDIS_STRING, sdscatprintf(sdsemtpy(), "select %d\r\n", dictid));
+                    selectcmd->refcount = 0;
+                    break;
+                }
+                addReply(slave, selectcmd);
+                slave->slaveseldb = dictid;
+            }
+        }
+        //传输实际命令
+        for(int j = 0; j < outc; j++){
+            addReply(slave, outv[j]);
+        }
+        ln = ln->next;
+    }
 }
 
 static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask){
@@ -1085,11 +1188,11 @@ again:
             int argc;
             sds *argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
             sdsfree(query); //再见了，c->querybuf已经指向新的结构了
-            if(argv == NULL)    oom("Splitting query in token");
+            if(argv == NULL)    oom("sdssplitlen");
             for(int i = 0; i < argc && i < LEDIS_MAX_ARGS; i++){
                 if(sdslen(argv[i])){
                     //终于把命令弄进去了
-                    c->argv[c->argc] = argv[i];
+                    c->argv[c->argc] = createObject(LEDIS_STRING, argv[i]);
                     c->argc++;
                 }else{
                     sdsfree(argv[i]);   //不赋值，则必须立刻回收
@@ -1106,7 +1209,7 @@ again:
     }else{  //如果bulk数据不是一起来的，在下一次才来，就会进入这里直接处理
         int qbl = sdslen(c->querybuf);  
         if(c->bulklen <= qbl){  //querybuf里面的实际数据长度，至少要大于上次bulklen才对
-            c->argv[c->argc] = sdsnewlen(c->querybuf, c->bulklen - 2);  //填充bulk数据
+            c->argv[c->argc] = createStringObject(c->querybuf, c->bulklen - 2);  //填充bulk数据
             c->argc++;
             c->querybuf = sdsrange(c->querybuf, c->bulklen, -1);
             processCommand(c);
@@ -1123,15 +1226,16 @@ static int selectDb(ledisClient *c, int id){
         return LEDIS_ERR;
     }
     c->dict = server.dict[id];
+    c->dictid = id;
     return LEDIS_OK;
 }
 
-static int createClient(int fd){
+static ledisClient *createClient(int fd){
     ledisClient *c = malloc(sizeof(*c));
 
     anetNonBlock(NULL, fd); //开启非阻塞
     anetTcpNoDelay(NULL, fd);   //开启TCP_NODELAY
-    if(!c)  return LEDIS_ERR;
+    if(!c)  return NULL;
     selectDb(c, 0); //将客户端对接0号表
     //初始化各个字段
     c->fd = fd;
@@ -1139,17 +1243,18 @@ static int createClient(int fd){
     c->argc = 0;
     c->bulklen = -1;
     c->sentlen = 0;
+    c->flags = 0;
     c->lastinteraction = time(NULL);
     if((c->reply = listCreate()) == NULL)   oom("listCreate");
     listSetFreeMethod(c->reply, decrRefCount);
     //将client的fd也加入到eventLoop中（存在2种fd，监听新请求/建立起来的客户端后续请求）
     if(aeCreateFileEvent(server.el, fd, AE_READABLE, readQueryFromClient, c, NULL) == AE_ERR){
         freeClient(c);
-        return LEDIS_ERR;
+        return NULL;
     }
     //添加到server.clients的尾部
     if(!listAddNodeTail(server.clients, c)) oom("listAddNodeTail");
-    return LEDIS_OK;
+    return c;
 }
 
 static void addReply(ledisClient *c, lobj *obj){
@@ -1187,7 +1292,7 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
     //得到客户端fd了
     ledisLog(LEDIS_DEBUG, "Accepted %s:%d", cip, cport);
     //根据得到的fd创建client结构
-    if(createClient(cfd) == LEDIS_ERR){
+    if(createClient(cfd) == NULL){
         ledisLog(LEDIS_WARNING, "Error allocating resoures for the client");
         close(cfd); //状态此时不一定
         return;
@@ -1219,14 +1324,29 @@ static lobj *createObject(int type, void *ptr){
 }
 
 /**
+ * 创建一个sds类型的对象
+ */ 
+static lobj *createStringObject(char *ptr, size_t len){
+    return createObject(LEDIS_STRING, sdsnewlen(ptr, len));
+}
+
+/**
  * 创建一个list类型的对象
  */ 
 static lobj *createListObject(void){
     list *l = listCreate();
-    if(!l)  oom("createListObject");
+    if(!l)  oom("listCreate");
     listSetFreeMethod(l, decrRefCount); //重要一步，所有的obj都要绑定decrRefCount函数
     return createObject(LEDIS_LIST, l);
 }
+
+#if 0
+static lobj *createHashObject(void){
+    dict *d = dictCreate(&hashDictType, NULL);
+    if(!d) oom("dictCreate");
+    return createObject(LEDIS_SET, d);
+}
+#endif
 
 /**
  * 创建一个set类型的对象，内部是个只有key的dict
@@ -1254,10 +1374,12 @@ static void decrRefCount(void *obj){
             case LEDIS_STRING : freeStringObject(o);    break;
             case LEDIS_LIST : freeListObject(o);    break;
             case LEDIS_SET : freeSetObject(o);    break;
+            case LEDIS_HASH : freeHashObject(o);    break;
             default : assert(0 != 0);   break;
         }
         //引用为0,只是free里面的ptr数据，obj本身会加入到free列表首部，等待复用
-        if(!listAddNodeHead(server.objfreelist, o)){
+        if(listLength(server.objfreelist) > LEDIS_OBJFREELIST_MAX || 
+            !listAddNodeHead(server.objfreelist, o)){
             free(o);
         }
     }
@@ -1275,6 +1397,13 @@ static void freeStringObject(lobj *o){
  */ 
 static void freeListObject(lobj *o){
     listRelease((list*)o->ptr);
+}
+
+/**
+ * 释放hash类型的obj
+ */ 
+static void freeHashObject(lobj *o){
+    dictRelease((dict*)o->ptr);
 }
 
 /**
@@ -1321,14 +1450,14 @@ static int saveDb(char *filename){
 
         //利用迭代器，遍历当前DB的每个entry
         while((de = dictNext(di)) != NULL){
-            sds key = dictGetEntryKey(de);
+            lobj *key = dictGetEntryKey(de);
             lobj *o = dictGetEntryVal(de);
             type = o->type;
-            len = htonl(sdslen(key));
+            len = htonl(sdslen(key->ptr));
             //写入key信息
             if(fwrite(&type, 1, 1, fp) == 0) goto werr; //对应val的类型
             if(fwrite(&len, 4, 1, fp) == 0) goto werr;
-            if(fwrite(key, sdslen(key), 1, fp) == 0) goto werr;
+            if(fwrite(key->ptr, sdslen(key->ptr), 1, fp) == 0) goto werr;
             //根据不同类型，写val信息
             if(type == LEDIS_STRING){
                 sds sval = o->ptr;
@@ -1374,6 +1503,8 @@ static int saveDb(char *filename){
     //结尾标识
     type = LEDIS_EOF;
     if(fwrite(&type, 1, 1, fp) == 0) goto werr;
+    fflush(fp);
+    fsync(fileno(fp));
     fclose(fp);
 
     //临时文件生成完毕，要重命名为正式的文件名
@@ -1510,7 +1641,7 @@ static int loadDb(char *filename){
         }
 
         //lobj生成了，还需要弄到dict里
-        retval = dictAdd(d, sdsnewlen(key, klen), o);
+        retval = dictAdd(d, createStringObject(key, klen), o);
         if(retval == DICT_ERR){
             ledisLog(LEDIS_WARNING, "Loading DB, duplicated key found! Unrecoverable error, exiting now.");
             exit(EXIT_FAILURE);
@@ -1542,11 +1673,180 @@ static void pingCommand(ledisClient *c){
 }
 
 static void echoCommand(ledisClient *c){
-    addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(c->argv[1])));
-    addReplySds(c, c->argv[1]);
+    addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(c->argv[1]->ptr)));
+    addReply(c, c->argv[1]);
     addReply(c, shared.crlf);
     //已经被reply内部指向，要变成裸指针，防止被free
     c->argv[1] = NULL;
+}
+
+/*====================================== 字符串相关 ===============================*/
+
+static void setGenericCommand(ledisClient *c, int nx){
+   
+    int retval = dictAdd(c->dict, c->argv[1], c->argv[2]);
+    if(retval == DICT_ERR){
+        if(!nx){    //如果是setCommand，直接覆盖原来的val
+            dictReplace(c->dict, c->argv[1], c->argv[2]);
+            incrRefCount(c->argv[2]); 
+        }else{  //如果是setnxCommand，则撤销val
+            addReply(c, shared.zero);
+            return;
+        }
+    }else{
+        incrRefCount(c->argv[1]);
+        incrRefCount(c->argv[2]);
+    }
+    server.dirty++;
+    addReply(c, nx ? shared.one : shared.ok);
+}
+
+static void setCommand(ledisClient *c){
+    setGenericCommand(c, 0);
+}
+
+static void setnxCommand(ledisClient *c){
+    setGenericCommand(c, 1);
+}
+
+static void getCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.nil);
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type != LEDIS_STRING){
+            addReply(c, shared.wrongtypeerrbulk);
+        }else{
+            //正常情况
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(o->ptr)));
+            addReply(c, o);
+            addReply(c, shared.crlf);
+        }
+    }
+}
+
+static void incrDecrCommand(ledisClient *c, int incr){
+    
+    long long value;
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        value = 0;  //没有key则将val为0
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_STRING){
+            //如果原来的val是字符串，强制转成ll
+            char *endp;
+            value = strtoll(o->ptr, &endp, 10);
+        }else{
+            value = 0;  //val不是sds，强制改成0，而不是返回错误之类的
+        }
+    }
+
+    value += incr;//自增或者自减
+    lobj *obj = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%lld", value));
+    //放冰箱里
+    if(dictAdd(c->dict, c->argv[1], obj) == DICT_OK){
+        incrRefCount(c->argv[1]);
+    }else{
+        //如果存在key，则直接替换
+        dictReplace(c->dict, c->argv[1], obj);
+    }
+    server.dirty++; //无论如何都会改变
+    addReply(c, obj);
+    addReply(c, shared.crlf);
+}
+
+static void incrCommand(ledisClient *c){
+    incrDecrCommand(c, 1);
+}
+
+static void decrCommand(ledisClient *c){
+    incrDecrCommand(c, -1);
+}
+
+static void incrbyCommand(ledisClient *c){
+    int incr = atoi(c->argv[2]->ptr);
+    incrDecrCommand(c, incr);
+}
+
+static void decrbyCommand(ledisClient *c){
+    int incr = atoi(c->argv[2]->ptr);
+    incrDecrCommand(c, -incr);
+}
+
+/*====================================== 其他相关 ===============================*/
+
+static void delCommand(ledisClient *c){
+    
+    if(dictDelete(c->dict, c->argv[1]) == DICT_OK){
+        server.dirty++;
+        addReply(c, shared.ok);
+    }else{
+        addReply(c, shared.zero);
+    }
+}
+
+static void existsCommand(ledisClient *c){
+    
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+    }else{
+        addReply(c, shared.one);
+    }
+}
+
+static void selectCommand(ledisClient *c){
+    int id = atoi(c->argv[1]->ptr);
+    if(selectDb(c, id) == LEDIS_OK){
+        addReply(c, shared.ok);
+        addReply(c, shared.crlf);
+    }else{
+        addReplySds(c, sdsnew("-ERR invalid DB index\r\n"));    //原版直接返回C字符串，可能有问题，只有sds才能使用sds相关函数
+    }
+}
+
+static void randomKeyCommand(ledisClient *c){
+    dictEntry *de = dictGetRandomKey(c->dict);
+    if(de){
+        addReply(c, dictGetEntryKey(de));
+        addReply(c, shared.crlf);
+    }else{
+        addReply(c, shared.crlf);
+    }
+}
+
+static void keysCommand(ledisClient *c){
+    sds pattern = c->argv[1]->ptr;
+    int plen = sdslen(c->argv[1]);
+    int numkeys = 0, keyslen = 0;
+    lobj *lenobj = createObject(LEDIS_STRING, NULL);
+
+    dictIterator *di = dictGetIterator(c->dict);
+    if(!di) oom("dictGetIterator");
+
+    addReply(c, lenobj);    //最后还会改里面的值，先占位
+    decrRefCount(lenobj);
+
+    //遍历dict，寻找匹配的key
+    dictEntry *de;
+    while((de = dictNext(di)) != NULL){
+        lobj *keyobj = dictGetEntryKey(de);
+        sds key = keyobj->ptr;
+        if((pattern[0] == '*' && pattern[1] == '\0') || 
+            stringmatchlen(pattern, plen, key, sdslen(key), 0)){
+            //匹配则加入结果字符串中，并用空格分隔
+            if(numkeys != 0) addReply(c, shared.space);
+            addReply(c, keyobj);
+            numkeys++;
+            keyslen += sdslen(key);
+        }
+    }
+    dictReleaseIterator(di);
+    //为啥数目和长度要加一起
+    lenobj->ptr = sdscatprintf(sdsemtpy(), "%lu\r\n", keyslen+(numkeys ? (numkeys-1) : 0));
+    addReply(c, shared.crlf);
 }
 
 static void saveCommand(ledisClient *c){
@@ -1573,170 +1873,7 @@ static void dbsizeCommand(ledisClient *c){
     addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", dictGetHashTableUsed(c->dict)));
 }
 
-static void setGenericCommand(ledisClient *c, int nx){
-    lobj *o = createObject(LEDIS_STRING, c->argv[2]);
-    c->argv[2] = NULL;
-    int retval = dictAdd(c->dict, c->argv[1], o);
-    if(retval == DICT_ERR){
-        if(!nx){    //如果是setCommand，直接覆盖原来的val
-            dictReplace(c->dict, c->argv[1], o); 
-        }else{  //如果是setnxCommand，则撤销val
-            decrRefCount(o);
-            addReply(c, shared.zero);
-            return;
-        }
-    }else{
-        //已经被dict内部指向，要变成裸指针，防止被free
-        c->argv[1] = NULL;
-    }
-    server.dirty++;
-    addReply(c, nx ? shared.one : shared.ok);
-}
 
-static void setCommand(ledisClient *c){
-    setGenericCommand(c, 0);
-}
-
-static void setnxCommand(ledisClient *c){
-    setGenericCommand(c, 1);
-}
-
-static void getCommand(ledisClient *c){
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    if(de == NULL){
-        addReply(c, shared.nil);
-    }else{
-        lobj *o = dictGetEntryVal(de);
-        if(o->type != LEDIS_STRING){
-            char *err = "-ERR GET against key not holding a string value";
-            //err是局部的，但sdscatprintf会去复制字符串
-            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
-        }else{
-            //正常情况
-            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(o->ptr)));
-            addReply(c, o);
-            addReply(c, shared.crlf);
-        }
-    }
-}
-
-static void delCommand(ledisClient *c){
-    
-    if(dictDelete(c->dict, c->argv[1]) == DICT_OK){
-        server.dirty++;
-        addReply(c, shared.ok);
-    }else{
-        addReply(c, shared.zero);
-    }
-    
-}
-
-static void existsCommand(ledisClient *c){
-    
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    if(de == NULL){
-        addReply(c, shared.zero);
-    }else{
-        addReply(c, shared.one);
-    }
-}
-
-static void incrDecrCommand(ledisClient *c, int incr){
-    
-    long long value;
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    if(de == NULL){
-        value = 0;  //没有key则将val为0
-    }else{
-        lobj *o = dictGetEntryVal(de);
-        if(o->type == LEDIS_STRING){
-            //如果原来的val是字符串，强制转成ll
-            char *endp;
-            value = strtoll(o->ptr, &endp, 10);
-        }else{
-            value = 0;  //val不是sds，强制改成0，而不是返回错误之类的
-        }
-    }
-
-    value += incr;//自增或者自减
-    sds newval = sdscatprintf(sdsempty(), "%lld", value);
-    lobj *obj = createObject(LEDIS_STRING, newval);
-    //放冰箱里
-    if(dictAdd(c->dict, c->argv[1], obj) == DICT_OK){
-        //已经被dict内部指向，要变成裸指针，防止被free
-        c->argv[1] = NULL;
-    }else{
-        //如果存在key，则直接替换
-        dictReplace(c->dict, c->argv[1], obj);
-    }
-    server.dirty++; //无论如何都会改变
-    addReply(c, obj);
-    addReply(c, shared.crlf);
-}
-
-static void incrCommand(ledisClient *c){
-    incrDecrCommand(c, 1);
-}
-
-static void decrCommand(ledisClient *c){
-    incrDecrCommand(c, -1);
-}
-
-static void incrbyCommand(ledisClient *c){
-    int incr = atoi(c->argv[2]);
-    incrDecrCommand(c, incr);
-}
-
-static void decrbyCommand(ledisClient *c){
-    int incr = atoi(c->argv[2]);
-    incrDecrCommand(c, -incr);
-}
-
-static void selectCommand(ledisClient *c){
-    int id = atoi(c->argv[1]);
-    if(selectDb(c, id) == LEDIS_OK){
-        addReply(c, shared.ok);
-        addReply(c, shared.crlf);
-    }else{
-        addReplySds(c, sdsnew("-ERR invalid DB index\r\n"));    //原版直接返回C字符串，可能有问题，只有sds才能使用sds相关函数
-    }
-}
-
-static void randomKeyCommand(ledisClient *c){
-    dictEntry *de = dictGetRandomKey(c->dict);
-    if(de){
-        addReplySds(c, sdsdup(dictGetEntryKey(de)));
-        addReply(c, shared.crlf);
-    }else{
-        addReply(c, shared.crlf);
-    }
-}
-
-static void keysCommand(ledisClient *c){
-    sds pattern = c->argv[1];
-    int plen = sdslen(c->argv[1]);
-    dictIterator *di = dictGetIterator(c->dict);
-    sds keys = sdsempty();
-
-    //遍历dict，寻找匹配的key
-    dictEntry *de;
-    while((de = dictNext(di)) != NULL){
-        sds key = dictGetEntryKey(de);
-        if((pattern[0] == '*' && pattern[1] == '\0') || 
-            stringmatchlen(pattern, plen, key, sdslen(key), 0)){
-            //匹配则加入结果字符串中，并用空格分隔
-            keys = sdscatlen(keys, key, sdslen(key));
-            keys = sdscatlen(keys, " ", 1);
-        }
-    }
-    dictReleaseIterator(di);
-    keys = sdstrim(keys, " ");  //trim
-    sds reply = sdscatprintf(sdsempty(), "%lu\r\n", sdslen(keys));
-    reply = sdscatlen(reply, keys, sdslen(keys));
-    reply = sdscatlen(reply, "\r\n", 2);
-    sdsfree(keys);  //必须
-    addReplySds(c, reply);
-}
 
 static void lastsaveCommand(ledisClient *c){
     addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", server.lastsave));
