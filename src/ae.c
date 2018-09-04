@@ -320,7 +320,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
 }
 
 /**
- * 尝试调用一次select轮询，查看给定的单个fd是否就绪，timeout参数由传入的时间参数指定
+ * 立即尝试调用一次select轮询，查看给定的单个fd是否就绪，timeout参数由传入的时间参数指定
  */ 
 int aeWait(int fd, int mask, long long milliseconds){
     

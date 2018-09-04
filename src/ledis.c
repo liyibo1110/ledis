@@ -257,7 +257,7 @@ static struct ledisCommand cmdTable[] = {
     {"incrby",incrbyCommand,2,LEDIS_CMD_INLINE},
     {"decrby",decrbyCommand,2,LEDIS_CMD_INLINE},
 
-    {"randomKey",randomKeyCommand,1,LEDIS_CMD_INLINE},
+    {"randomkey",randomKeyCommand,1,LEDIS_CMD_INLINE},
     {"select",selectCommand,2,LEDIS_CMD_INLINE},
     {"move",moveCommand,3,LEDIS_CMD_INLINE},
     {"rename",renameCommand,3,LEDIS_CMD_INLINE},
@@ -1020,7 +1020,7 @@ static void resetClient(ledisClient *c){
  */ 
 static int processCommand(ledisClient *c){
 
-    //sdstolower(c->argv[0]);
+    sdstolower(c->argv[0]->ptr);
 
     if(!strcmp(c->argv[0]->ptr, "quit")){
         freeClient(c);
@@ -1849,6 +1849,33 @@ static void keysCommand(ledisClient *c){
     addReply(c, shared.crlf);
 }
 
+static void dbsizeCommand(ledisClient *c){
+    addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", dictGetHashTableUsed(c->dict)));
+}
+
+static void lastsaveCommand(ledisClient *c){
+    addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", server.lastsave));
+}
+
+static void typeCommand(ledisClient *c){
+    
+    char *type;
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        type = "none";
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        switch(o->type){
+            case LEDIS_STRING: type = "string"; break;
+            case LEDIS_LIST: type = "list"; break;
+            case LEDIS_SET: type = "set"; break;
+            default: type = "unknown"; break;
+        }
+    }
+    addReplySds(c, sdsnew(type));
+    addReply(c, shared.crlf);
+}
+
 static void saveCommand(ledisClient *c){
     if(saveDb("dump.ldb") == LEDIS_OK){
         addReply(c, shared.ok);
@@ -1869,16 +1896,6 @@ static void bgsaveCommand(ledisClient *c){
     }
 }
 
-static void dbsizeCommand(ledisClient *c){
-    addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", dictGetHashTableUsed(c->dict)));
-}
-
-
-
-static void lastsaveCommand(ledisClient *c){
-    addReplySds(c, sdscatprintf(sdsempty(), "%lu\r\n", server.lastsave));
-}
-
 static void shutdownCommand(ledisClient *c){
     ledisLog(LEDIS_WARNING, "User requested shutdown, saving DB...");
     if(saveDb("dump.ldb") == LEDIS_OK){
@@ -1893,7 +1910,7 @@ static void shutdownCommand(ledisClient *c){
 static void renameGenericCommand(ledisClient *c, int nx){
     
     //新旧key不能一样
-    if(sdscmp(c->argv[1], c->argv[2]) == 0){
+    if(sdscmp(c->argv[1]->ptr, c->argv[2->ptr]) == 0){
         if(nx){
             addReply(c, shared.minus3);
         }else{
@@ -1907,7 +1924,7 @@ static void renameGenericCommand(ledisClient *c, int nx){
         if(nx){
             addReply(c, shared.minus1);
         }else{
-            addReplySds(c, sdsnew("-ERR no such key\r\n"));
+            addReply(c, shared.nokeyerr;
         }
         return;
     }
@@ -1925,8 +1942,7 @@ static void renameGenericCommand(ledisClient *c, int nx){
             dictReplace(c->dict, c->argv[2], o);
         }
     }else{
-        //如果ok，argv[2]里面的key已经被dict的结构指向了，所以最好干掉argv[1]的指向，以防被free
-        c->argv[2] = NULL;
+        incrRefCount(c->argv[2]);
     }
     dictDelete(c->dict, c->argv[1]);
     server.dirty++;
@@ -1942,13 +1958,14 @@ static void renamenxCommand(ledisClient *c){
 
 static void moveCommand(ledisClient *c){
     dict *src = c->dict;    //备份指向
-    if(selectDb(c, atoi(c->argv[2])) == LEDIS_ERR){
+    int srcid = c->dictid;
+    if(selectDb(c, atoi(c->argv[2]->ptr)) == LEDIS_ERR){
         addReply(c, shared.minus4);
         return;
     }
     dict *dst = c->dict;    //新的DB指向
     c->dict = src;  //指回去
-
+    c->dictid = srcid;
     if(src == dst){ //不能一样
         addReply(c, shared.minus3);
         return;
@@ -1961,24 +1978,25 @@ static void moveCommand(ledisClient *c){
     }
 
     //将key尝试放到新的DB里面
-    sds *key = dictGetEntryKey(de); //得是指针
+    lobj *key = dictGetEntryKey(de); //得是指针
     lobj *o = dictGetEntryVal(de);
     if(dictAdd(dst, key, o) == DICT_ERR){
         addReply(c, shared.zero);
         return;
     }
+    incrRefCount(key);
+    incrRefCount(o);
 
     //清理src的节点，但是只是移除结构并不能free，只是指向改变了而已
-    dictDeleteNoFree(src, c->argv[1]);
+    dictDelete(src, c->argv[1]);
     server.dirty++;
     addReply(c, shared.one);
 }
 
+/*====================================== LIST相关 ===============================*/
+
 static void pushGenericCommand(ledisClient *c, int where){
     
-    lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
-    c->argv[2] = NULL;
-
     dictEntry *de = dictFind(c->dict, c->argv[1]);
     lobj *lobj;
     list *list;
@@ -1986,26 +2004,27 @@ static void pushGenericCommand(ledisClient *c, int where){
         lobj = createListObject();
         list = lobj->ptr;
         if(where == LEDIS_HEAD){
-            if(!listAddNodeHead(list, ele)) oom("listAddNodeHead");
+            if(!listAddNodeHead(list, c->argv[2])) oom("listAddNodeHead");
         }else{
-            if(!listAddNodeTail(list, ele)) oom("listAddNodeTail");
+            if(!listAddNodeTail(list, c->argv[2])) oom("listAddNodeTail");
         }
         dictAdd(c->dict, c->argv[1], lobj);
-        c->argv[1] = NULL;  //变成裸指针，防止arv[1]被free
+        incrRefCount(c->argv[1]);
+        incrRefCount(c->argv[2]);
     }else{
         lobj = dictGetEntryVal(de);
         //检查类型，必须是list
         if(lobj->type != LEDIS_LIST){
-            decrRefCount(ele);
-            addReplySds(c, sdsnew("-ERR push against existing key not holding a list\r\n"));
+            addReply(c, shared.wrongtypeerr);
             return;
         }
         list = lobj->ptr;
         if(where == LEDIS_HEAD){
-            if(!listAddNodeHead(list, ele)) oom("listAddNodeHead");
+            if(!listAddNodeHead(list, c->argv[2])) oom("listAddNodeHead");
         }else{
-            if(!listAddNodeTail(list, ele)) oom("listAddNodeTail");
+            if(!listAddNodeTail(list, c->argv[2])) oom("listAddNodeTail");
         }
+        incrRefCount(c->argv[2]);
     }
     server.dirty++;
     addReply(c, shared.ok);
@@ -2019,6 +2038,82 @@ static void rpushCommand(ledisClient *c){
     pushGenericCommand(c, LEDIS_TAIL);
 }
 
+static void llenCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.zero);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_LIST){
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", listLength((list*)o->ptr)));
+        }else{
+            addReply(c, shared.minus2);
+            return;
+        }
+    }
+}
+
+static void lindexCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    int index = atoi(c->argv[2]->ptr);
+    if(de == NULL){
+        addReply(c, shared.nil);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type == LEDIS_LIST){
+            list *list = o->ptr;
+            listNode *node = listIndex(list, index);
+            if(node == NULL){
+                addReply(c, shared.nil);
+                return;
+            }else{
+                lobj *ele = listNodeValue(node);
+                //返回BULK类型
+                addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(ele->ptr)));
+                addReply(c, ele);
+                addReply(c, shared.crlf);
+                return;
+            }
+        }else{
+            addReply(c, shared.wrongtypeerrbulk);
+            return;
+        }
+    }
+}
+
+static void lsetCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    int index = atoi(c->argv[2]->ptr);
+    if(de == NULL){
+        addReply(c, shared.nokeyerr);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type != LEDIS_LIST){
+            addReply(c, shared.wrongtypeerr);
+            return;
+        }else{
+            //是list就可以尝试set了
+            list *list = o->ptr;
+            listNode *ln = listIndex(list, index);
+            if(ln == NULL){
+                addReplySds(c, sdsnew("-ERR index out of range\r\n"));
+                return;
+            }else{
+                lobj *ele = listNodeValue(ln);
+                decrRefCount(ele);  //删除原来的
+                listNodeValue(ln) = c->argv[3];
+                incrRefCount(c->argv[3]);
+                addReply(c, shared.ok);
+                server.dirty++;
+                return;
+            }
+        }
+    }
+}
+
 static void popGenericCommand(ledisClient *c, int where){
     
     dictEntry *de = dictFind(c->dict, c->argv[1]);
@@ -2027,8 +2122,7 @@ static void popGenericCommand(ledisClient *c, int where){
     }else{
        lobj *o = dictGetEntryVal(de);
        if(o->type != LEDIS_LIST){
-           char *err = "-ERR POP against key not holding a list value";
-           addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+           addReply(c, shared.wrongtypeerrbulk);
        }else{
            list *list = o->ptr;
            listNode *node;
@@ -2060,87 +2154,10 @@ static void rpopCommand(ledisClient *c){
     popGenericCommand(c, LEDIS_TAIL);
 }
 
-static void llenCommand(ledisClient *c){
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    if(de == NULL){
-        addReply(c, shared.zero);
-        return;
-    }else{
-        lobj *o = dictGetEntryVal(de);
-        if(o->type == LEDIS_LIST){
-            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", listLength((list*)o->ptr)));
-        }else{
-            addReply(c, shared.minus2);
-            return;
-        }
-    }
-}
-
-static void lindexCommand(ledisClient *c){
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    int index = atoi(c->argv[2]);
-    if(de == NULL){
-        addReply(c, shared.nil);
-        return;
-    }else{
-        lobj *o = dictGetEntryVal(de);
-        if(o->type == LEDIS_LIST){
-            list *list = o->ptr;
-            listNode *node = listIndex(list, index);
-            if(node == NULL){
-                addReply(c, shared.nil);
-                return;
-            }else{
-                lobj *ele = listNodeValue(node);
-                //返回BULK类型
-                addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", (int)sdslen(ele->ptr)));
-                addReply(c, ele);
-                addReply(c, shared.crlf);
-                return;
-            }
-        }else{
-            char *err = "-ERR LINDEX against key not holding a list value";
-            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
-            return;
-        }
-    }
-}
-
-static void lsetCommand(ledisClient *c){
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    int index = atoi(c->argv[2]);
-    if(de == NULL){
-        addReplySds(c, sdsnew("-ERR no such key\r\n"));
-        return;
-    }else{
-        lobj *o = dictGetEntryVal(de);
-        if(o->type != LEDIS_LIST){
-            addReplySds(c, sdsnew("-ERR LSET against key not holding a list value\r\n"));
-            return;
-        }else{
-            //是list就可以尝试set了
-            list *list = o->ptr;
-            listNode *ln = listIndex(list, index);
-            if(ln == NULL){
-                addReplySds(c, sdsnew("-ERR index out of range\r\n"));
-                return;
-            }else{
-                lobj *ele = listNodeValue(ln);
-                decrRefCount(ele);  //删除原来的
-                listNodeValue(ln) = createObject(LEDIS_STRING, c->argv[3]);
-                c->argv[3] = NULL;  //裸指针避免被free
-                addReply(c, shared.ok);
-                server.dirty++;
-                return;
-            }
-        }
-    }
-}
-
 static void lrangeCommand(ledisClient *c){
     dictEntry *de = dictFind(c->dict, c->argv[1]);
-    int start = atoi(c->argv[2]);
-    int end = atoi(c->argv[3]);
+    int start = atoi(c->argv[2]->ptr);
+    int end = atoi(c->argv[3]->ptr);
     if(de == NULL){
         addReply(c, shared.nil);
         return;
@@ -2177,8 +2194,7 @@ static void lrangeCommand(ledisClient *c){
             }
             return;
         }else{
-            char *err = "-ERR LRANGE against key not holding a list value";
-            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+            addReply(c, shared.wrongtypeerrbulk);
             return;
         }
     }
@@ -2186,10 +2202,10 @@ static void lrangeCommand(ledisClient *c){
 
 static void ltrimCommand(ledisClient *c){
     dictEntry *de = dictFind(c->dict, c->argv[1]);
-    int start = atoi(c->argv[2]);
-    int end = atoi(c->argv[3]);
+    int start = atoi(c->argv[2]->ptr);
+    int end = atoi(c->argv[3]->ptr);
     if(de == NULL){
-        addReplySds(c, sdsnew("-ERR no such key\r\n"));
+        addReply(c, shared.nokeyerr);
         return;
     }else{
         lobj *o = dictGetEntryVal(de);
@@ -2225,30 +2241,13 @@ static void ltrimCommand(ledisClient *c){
             server.dirty++; //只算一次变动
             return;
         }else{
-            addReplySds(c, sdsnew("-ERR LTRIM against key not holding a list value"));
+            addReply(c, shared.wrongtypeerr);
             return;
         }
     }
 }
 
-static void typeCommand(ledisClient *c){
-    
-    char *type;
-    dictEntry *de = dictFind(c->dict, c->argv[1]);
-    if(de == NULL){
-        type = "none";
-    }else{
-        lobj *o = dictGetEntryVal(de);
-        switch(o->type){
-            case LEDIS_STRING: type = "string"; break;
-            case LEDIS_LIST: type = "list"; break;
-            case LEDIS_SET: type = "set"; break;
-            default: type = "unknown"; break;
-        }
-    }
-    addReplySds(c, sdsnew(type));
-    addReply(c, shared.crlf);
-}
+/*====================================== SET相关 ===============================*/
 
 static void saddCommand(ledisClient *c){
     dictEntry *de = dictFind(c->dict, c->argv[1]);
@@ -2257,7 +2256,7 @@ static void saddCommand(ledisClient *c){
         //没有这个key则新增，val为SET类型的obj
         set = createSetObject();
         dictAdd(c->dict, c->argv[1], set);  //find过了所以肯定成功
-        c->argv[1] = 0; //？就是NULL啊
+        incrRefCount(c->argv[1]);
     }else{
         //已经有key了，则追加
         set = dictGetEntryVal(de);
@@ -2267,14 +2266,11 @@ static void saddCommand(ledisClient *c){
         }
     }
     //只是处理好了set本身，还要处理set里面dict的key们
-    lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
-    c->argv[2] = NULL;
-    if(dictAdd(set->ptr, ele, NULL) == DICT_OK){
+    if(dictAdd(set->ptr, c->argv[2], NULL) == DICT_OK){
         server.dirty++;
         addReply(c, shared.one);
         return;
     }else{
-        decrRefCount(ele);  //再删了
         addReply(c, shared.zero);
         return;
     }
@@ -2292,16 +2288,12 @@ static void sremCommand(ledisClient *c){
             return;
         }else{
             //尝试删除里面dict的key（也就是单个元素）
-            lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
-            if(dictDelete(set->ptr, ele) == DICT_OK){
+            if(dictDelete(set->ptr, c->argv[2]) == DICT_OK){
                 server.dirty++;
                 addReply(c, shared.one);
             }else{
                 addReply(c, shared.zero);
             }
-            //清理
-            ele->ptr = NULL;    //有啥用
-            decrRefCount(ele);
             return;
         }
     }
@@ -2319,14 +2311,11 @@ static void sismemberCommand(ledisClient *c){
             return;
         }else{
             //查找
-            lobj *ele = createObject(LEDIS_STRING, c->argv[2]);
-            if(dictFind(set->ptr, ele)){
+            if(dictFind(set->ptr, c->argv[2])){
                 addReply(c, shared.one);
             }else{
                 addReply(c, shared.zero);
             }
-            ele->ptr = NULL;
-            decrRefCount(ele);
             return;
         }
     }
@@ -2374,8 +2363,7 @@ static void sinterCommand(ledisClient *c){
         lobj *setobj = dictGetEntryVal(de);
         if(setobj->type != LEDIS_SET){
             free(dv);
-            char *err = "-ERR LINTER against key not holding a set value";
-            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n%s\r\n", -((int)strlen(err)), err));
+            addReply(c, shared.wrongtypeerrbulk);
             return;
         }
         dv[i] = setobj->ptr;
@@ -2413,6 +2401,115 @@ static void sinterCommand(ledisClient *c){
     lenobj->ptr = sdscatprintf(sdsempty(), "%d\r\n", cardinality);  
     dictReleaseIterator(di);
     free(dv);
+}
+
+/*====================================== 主从相关 ===============================*/
+
+/**
+ * 发送所有未发的reply到客户端（即调sync命令的一端，应该是从），只在主从功能中被使用
+ */ 
+static int flushClientOutput(ledisClient *c){
+    
+    int retval;
+    time_t start = time(NULL);
+
+    while(listLength(c->reply)){
+        if(time(NULL)-start > 5) return LEDIS_ERR;  //只让运行5秒
+        retval = aeWait(c->fd, AE_WRITABLE, 1000);
+        if(retval == -1){
+            return LEDIS_ERR;
+        }else if(retval & AE_WRITABLE){
+            sendReplyToClient(NULL, c->fd, c, AE_WRITABLE);
+        }
+    }
+    return LEDIS_OK;
+}
+
+/**
+ * 本质还是调用write向fd写入数据，但要以间歇的方式，并且考虑数据分批
+ */ 
+static int syncWrite(int fd, void *ptr, ssize_t size, int timeout){
+
+    ssize_t nwritten, ret = size;
+    time_t start = time(NULL);
+    timeout++;  //加上aeWait的1秒
+
+    while(size){    //直到所有size都发送了
+        //确保就绪才会写，写死timeout为1秒
+        if(aeWait(fd, AE_WRITABLE, 1000) & AE_WRITABLE){
+            nwritten = write(fd, ptr, size);
+            if(nwritten == -1) return -1;   //出错了
+            ptr += nwritten;
+            size -= nwritten;
+        }
+        if((time(NULL)-start) > timeout){
+            errno = ETIMEDOUT;
+            return -1;
+        }
+    }
+    return ret; //肯定是size
+}
+
+/**
+ * 本质还是调用read从fd读入数据，但要以间歇的方式，并且考虑数据分批
+ */
+static int syncRead(int fd, void *ptr, ssize_t size, int timeout){
+
+    ssize_t nread, totread = 0;
+    time_t start = time(NULL);
+    timeout++;  //加上aeWait的1秒
+
+    while(size){    //直到所有size都发送了
+        //确保就绪才会写，写死timeout为1秒
+        if(aeWait(fd, AE_READABLE, 1000) & AE_READABLE){
+            nread = read(fd, ptr, size);
+            if(nread == -1) return -1;   //出错了
+            ptr += nread;
+            size -= nread;
+            totread += nread;
+        }
+        if((time(NULL)-start) > timeout){
+            errno = ETIMEDOUT;
+            return -1;
+        }
+    }
+    return totread; //肯定是size
+}
+
+/**
+ * 内部使用syncRead，但每次只读一行（遇到\r\n或\n结尾就算完）
+ */ 
+static int sycnReadLine(int fd, char *ptr, ssize_t size, int timeout){
+    ssize_t nread = 0;
+    //一个一个字符读
+    while(size){
+        char c;
+        if(syncRead(fd, &c, 1, timeout) == -1) return -1;
+        if(c == '\n'){  //如果是换行符，则封口ptr然后返回字符数
+            *ptr = '\0';
+            if(nread && *(ptr-1) == '\r') *(ptr-1) = '\0';
+            return nread;
+        }else{
+            *ptr++ = c;
+            *ptr = '\0';    //保险
+            nread++;
+        }
+    }
+    return nread;
+}
+
+/**
+ * 和主同步，只有从会调用
+ */ 
+static int syncWithMaster(void){
+    int fd = anetTcpConnect(NULL, server.masterhost, server.masterport);
+    if(fd == -1){
+        ledisLog(LEDIS_WARNING, "Unable to connect to MASTER: %s", strerror(errno));
+        return LEDIS_ERR;
+    }
+    //发起sync命令
+
+    //获取相应数据
 }
 
 /*====================================== 主函数 ===============================*/
