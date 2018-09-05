@@ -227,6 +227,8 @@ static void sismemberCommand(ledisClient *c);
 static void scardCommand(ledisClient *c);
 static void sinterCommand(ledisClient *c);
 
+static void syncCommand(ledisClient *c);
+
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
@@ -271,6 +273,7 @@ static struct ledisCommand cmdTable[] = {
     {"shutdown",shutdownCommand,1,LEDIS_CMD_INLINE},
     {"lastsave",lastsaveCommand,1,LEDIS_CMD_INLINE},
     {"type",typeCommand,2,LEDIS_CMD_INLINE},
+    {"sync",syncCommand,1,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -2406,7 +2409,7 @@ static void sinterCommand(ledisClient *c){
 /*====================================== 主从相关 ===============================*/
 
 /**
- * 发送所有未发的reply到客户端（即调sync命令的一端，应该是从），只在主从功能中被使用
+ * 发送所有未发的reply到客户端（即调sync命令的一端，从服务端），只在主从功能中被使用
  */ 
 static int flushClientOutput(ledisClient *c){
     
@@ -2498,18 +2501,124 @@ static int sycnReadLine(int fd, char *ptr, ssize_t size, int timeout){
     return nread;
 }
 
+static void syncCommand(ledisClient *c){
+    
+    struct stat sb;
+    int fd = -1;
+    time_t start = time(NULL);
+    char sizebuf[32];   //dump文件的大小
+    ledisLog(LEDIS_NOTICE, "slave ask for syncronization");
+    if(flushClientOutput(c) == LEDIS_ERR || saveDb("dump.ldb") != LEDIS_OK){
+        goto closeconn;
+    }
+
+    fd = open("dump.ldb", O_RDONLY);
+    if(fd == -1 || fstat(fd, &sb) == -1) goto closeconn;
+    int len = sb.st_size;
+
+    snprintf(sizebuf, 32, "%d\r\n", len);
+    //先返回文件大小
+    if(syncWrite(c->fd, sizebuf, strlen(sizebuf), 5) == -1) goto closeconn;
+    //直接传递整个ldb文件。。。
+    while(len){
+        char buf[1024];
+        
+        //60秒的同步时间
+        if(time(NULL)-start > LEDIS_MAX_SYNC_TIME) goto closeconn;
+        int nread = read(fd, buf, 1024);
+        if(nread == -1) goto closeconn;
+        len -= nread;
+        if(syncWrite(c->fd, buf, nread, 5) == -1) goto closeconn;
+    }
+    if(sycnWrite(c->fd, "\r\n", 2, 5) == -1) goto closeconn;
+    close(fd);
+    c->flags |= LEDIS_SLAVE;
+    c->slaveseldb = 0;
+    if(!listAddNodeTail(server.slaves, c)) oom("listAddNodeTail");
+    ledisLog(LEDIS_NOTICE, "Syncronization with slave succeeded");
+    return;
+closeconn:
+    if(fd != -1) close(fd);
+    c->flags |= LEDIS_CLOSE;
+    ledisLog(LEDIS_WARNING, "Syncronization with slave failed");
+    return;
+}
+
 /**
- * 和主同步，只有从会调用
+ * 和主同步，只有从会调用（在serverCron函数里周期性调用）
  */ 
 static int syncWithMaster(void){
+    
+    char buf[1024], tmpfile[256];
     int fd = anetTcpConnect(NULL, server.masterhost, server.masterport);
     if(fd == -1){
         ledisLog(LEDIS_WARNING, "Unable to connect to MASTER: %s", strerror(errno));
         return LEDIS_ERR;
     }
     //发起sync命令
-
+    if(syncWrite(fd, "SYNC \r\n", 7, 5) == -1){
+        close(fd);
+        ledisLog(LEDIS_WARNING, "I/O error writing to MASTER: %s", strerror(errno));
+        return LEDIS_ERR;
+    }
     //获取相应数据
+    if(syncReadLine(fd, buf, 1024, 5) == -1){
+        close(fd);
+        ledisLog(LEDIS_WARNING, "I/O error reading bulk count from MASTER: %s", 
+                    strerror(errno));
+        return LEDIS_ERR;
+    }
+    //先获取到的是dump文件大小
+    int dumpsize = atoi(buf);
+    ledisLog(LEDIS_NOTICE, "Receiving %d bytes data dump from MASTER", dumpsize);
+    //生成ldb文件临时文件名
+    snprintf(tmpfile, 256, "temp-%d.%ld.ldb", (int)time(NULL), (int)random());
+    int dfd = open(tmpfile, O_CREAT|O_WRONLY, 0644);
+    if(dfd == -1){
+        close(fd);
+        ledisLog(LEDIS_WARNING, "Opening the temp file needed for MASTER <-> SLAVE synchronization: %s", 
+                    strerror(errno));
+        return LEDIS_ERR;
+    }
+    //生成ldb文件
+    while(dumpsize){
+        int nread = read(fd, buf, (dumpsize < 1024 ? dumpsize : 1024));
+        if(nread == -1){
+            ledisLog(LEDIS_WARNING, "I/O error trying to sync with MASTER: %s", 
+                        strerror(errno));
+            close(fd);
+            close(dfd);
+            return LEDIS_ERR;
+        }
+        int nwritten = write(dfd, buf, nread);
+        if(nwritten == -1){
+            ledisLog(LEDIS_WARNING, "Write error writing to the DB dump file needed for MASTER <-> SLAVE synchronization: %s", 
+                        strerror(errno));
+            close(fd);
+            close(dfd);
+            return LEDIS_ERR;
+        }
+        dumpsize -= nread;
+    }
+    close(dfd);
+    //生成临时ldb文件完毕
+    if(rename(tmpfile, "dump.ldb") == -1){
+        ledisLog(LEDIS_WARNING, "Failed trying to rename the temp DB into dump.ldb in MASTER <-> SLAVE synchronization: %s", 
+                    strerror(errno));
+        unlink(tmpfile);
+        close(fd);
+        return LEDIS_ERR;
+    }
+    emptyDb();
+    if(loadDb("dump.ldb") != LEDIS_OK){
+        ledisLog(LEDIS_WARNING, "Failed trying to load the MASTER synchronization DB from disk");
+        close(fd);
+        return LEDIS_ERR;
+    }
+    server.master = createClient(fd);
+    server.master->flags |= LEDIS_MASTER;
+    server.replstate = LEDIS_REPL_CONNECTED;
+    return LEDIS_OK;
 }
 
 /*====================================== 主函数 ===============================*/

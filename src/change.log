@@ -3,7 +3,7 @@ beta-6变化
 1.增加slaveof，即从服务器可以配置主服务器的ip和port。
 2.增加glueoutputbuf，即合并推送要返回client的消息，默认开启。
 新功能：
-1.主从复制。
+1.主从复制。（原理是一开始从直接复制主的dump文件，然后当主进行了修改后，模拟TCP-Client给所有的从，发相同的command，让从自己再次执行，不太可靠）
 2.benckmark性能测试程序。
 修改BUG：
 1.
@@ -15,6 +15,7 @@ beta-6变化
 5.ledis增加了hash新类型，增加了obj池子的最大数目限制。
 6.client结构的argv字段，类型由字符串数组，改成obj指针的数组。
 7.精简了hash相关实现，无论是key还是val，以后都是obj形式封装，不会再直接是sds。
+8.针对上一条，修改了所有的command函数的细节，主要是dict的key/val以及返回reply。
 
 beta-5变化
 代码调整：
