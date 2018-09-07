@@ -174,6 +174,7 @@ static void decrRefCount(void *obj);
 static void freeStringObject(lobj *o);
 static void freeListObject(lobj *o);
 static void freeSetObject(lobj *o);
+static void freeHashObject(lobj *o);
 
 static void freeClient(ledisClient *c);
 static void addReply(ledisClient *c, lobj *obj);
@@ -452,14 +453,14 @@ static void oom(const char *msg){
 /**
  * 完全一样则返回1,否则返回0
  */ 
-/* static int sdsDictKeyCompare(void *privdata, const void *key1, const void *key2){
+static int sdsDictKeyCompare(void *privdata, const void *key1, const void *key2){
     
     DICT_NOTUSED(privdata);
     int l1 = sdslen((sds)key1);
     int l2 = sdslen((sds)key2);
     if(l1 != l2)    return 0;
     return memcmp(key1, key2, l1) == 0;
-} */
+}
 
 static void dictLedisObjectDestructor(void *privdata, void *val){
     DICT_NOTUSED(privdata);
@@ -624,9 +625,9 @@ static void createSharedObjects(void){
     shared.minus4 = createObject(LEDIS_STRING, sdsnew("-4\r\n"));
 
     shared.wrongtypeerr = createObject(LEDIS_STRING, sdsnew("-ERR Operation against a key holding the wrong kind of value\r\n"));
-    shared.wrongtypeerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty, "%d\r\n%s", -sdslen(shared.wrongtypeerr->ptr)+2, shared.wrongtypeerr->ptr));
+    shared.wrongtypeerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.wrongtypeerr->ptr)+2, shared.wrongtypeerr->ptr));
     shared.nokeyerr = createObject(LEDIS_STRING, sdsnew("-ERR no such key\r\n"));
-    shared.nokeyerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty, "%d\r\n%s", -sdslen(shared.nokeyerr->ptr)+2, shared.nokeyerr->ptr));
+    shared.nokeyerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.nokeyerr->ptr)+2, shared.nokeyerr->ptr));
 
     shared.space = createObject(LEDIS_STRING, sdsnew(" "));
     shared.select0 = createStringObject("select 0\r\n", 10);
@@ -711,7 +712,7 @@ static void initServer(){
         ledisLog(LEDIS_WARNING, "Opening TCP port: %s", server.neterr);
         exit(EXIT_FAILURE);
     }
-    printf("server.fd=%d\n", server.fd);
+    //printf("server.fd=%d\n", server.fd);
     //继续给dict数组内部真实分配
     for(int i = 0; i < server.dbnum; i++){
         server.dict[i] = dictCreate(&hashDictType, NULL);
@@ -933,7 +934,7 @@ static void glueReplyBuffersIfNeeded(ledisClient *c){
             memcpy(buf+copylen, o->ptr, sdslen(o->ptr));
             copylen += sdslen(o->ptr);
             listDelNode(c->reply, ln);
-            ln = ln->next;
+            ln = next;
         }
         addReplySds(c, sdsnewlen(buf, totlen));
     }
@@ -966,7 +967,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
         }else{
             //开始写入client，分段写入，并没有用到anet.c里面的anetWrite函数
             nwritten = write(fd, o->ptr + c->sentlen, objlen - c->sentlen);
-            printf("nwritten=%d\n", nwritten);
+            //printf("nwritten=%d\n", nwritten);
             if(nwritten <= 0)   break;
         }
         c->sentlen += nwritten;
@@ -977,7 +978,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
             listDelNode(c->reply, listFirst(c->reply));
             c->sentlen = 0;
         }
-        printf("reply over.\n");
+        //printf("reply over.\n");
     }
     if(nwritten == -1){
         if(errno == EAGAIN){
@@ -1090,7 +1091,7 @@ static void replicationFeedSlaves(struct ledisCommand *cmd, int dictid, lobj **a
     for(int i = 0; i < argc; i++){
         if(i != 0) outv[outc++] = shared.space;
         if((cmd->flags & LEDIS_CMD_BULK) && i == argc-1){   //特殊处理bulk类型
-            lobj *lenobj = createObject(LEDIS_STRING, sdscatprinf(sdsempty(), "%d\r\n", sdslen(argv[i]->ptr)));
+            lobj *lenobj = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n", sdslen(argv[i]->ptr)));
             lenobj->refcount = 0;   //要干啥
             outv[outc++] = lenobj;
         }
@@ -1115,7 +1116,7 @@ static void replicationFeedSlaves(struct ledisCommand *cmd, int dictid, lobj **a
                 case 8: selectcmd = shared.select8; break;
                 case 9: selectcmd = shared.select9; break;
                 default:{
-                    selectcmd = createObject(LEDIS_STRING, sdscatprintf(sdsemtpy(), "select %d\r\n", dictid));
+                    selectcmd = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "select %d\r\n", dictid));
                     selectcmd->refcount = 0;
                     break;
                 }
@@ -1135,12 +1136,12 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
     //此版本只需要使用fd和privdata
     LEDIS_NOTUSED(el);
     LEDIS_NOTUSED(mask);
-    printf("readQueryFromClient\n");
+    //printf("readQueryFromClient\n");
     ledisClient *c = (ledisClient *)privdata;
     char buf[LEDIS_QUERYBUF_LEN];
 
     int nread = read(fd, buf, LEDIS_QUERYBUF_LEN);
-    printf("nread=%d\n", nread);
+    //printf("nread=%d\n", nread);
     if(nread == -1){
         if(errno == EAGAIN){
             nread = 0;
@@ -1156,7 +1157,7 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
     }
     if(nread){  //总之真读到了数据才继续
         c->querybuf = sdscatlen(c->querybuf, buf ,nread);   //是往里面追加，所以可能有多组命令
-        printf("%s", c->querybuf);
+        //printf("%s", c->querybuf);
         c->lastinteraction = time(NULL);
     }else{
         return;
@@ -1285,9 +1286,9 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
 
     char cip[1025];  //写死的，不太好
     int cport;
-    printf("sdf=%d\n", fd);
+    //printf("sdf=%d\n", fd);
     int cfd = anetAccept(server.neterr, fd, cip, &cport);
-    printf("cdf=%d\n", cfd);
+    //printf("cdf=%d\n", cfd);
     if(cfd == AE_ERR){
         ledisLog(LEDIS_DEBUG, "Accepting client connection: %s", server.neterr);
         return;
@@ -1300,7 +1301,7 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
         close(cfd); //状态此时不一定
         return;
     }
-    printf("createClient is ok!\n");
+    //printf("createClient is ok!\n");
 }
 
 /*========================= ledis对象相关实现 ===============================*/
@@ -1822,7 +1823,7 @@ static void randomKeyCommand(ledisClient *c){
 
 static void keysCommand(ledisClient *c){
     sds pattern = c->argv[1]->ptr;
-    int plen = sdslen(c->argv[1]);
+    int plen = sdslen(pattern);
     int numkeys = 0, keyslen = 0;
     lobj *lenobj = createObject(LEDIS_STRING, NULL);
 
@@ -1848,7 +1849,7 @@ static void keysCommand(ledisClient *c){
     }
     dictReleaseIterator(di);
     //为啥数目和长度要加一起
-    lenobj->ptr = sdscatprintf(sdsemtpy(), "%lu\r\n", keyslen+(numkeys ? (numkeys-1) : 0));
+    lenobj->ptr = sdscatprintf(sdsempty(), "%lu\r\n", keyslen+(numkeys ? (numkeys-1) : 0));
     addReply(c, shared.crlf);
 }
 
@@ -1913,7 +1914,7 @@ static void shutdownCommand(ledisClient *c){
 static void renameGenericCommand(ledisClient *c, int nx){
     
     //新旧key不能一样
-    if(sdscmp(c->argv[1]->ptr, c->argv[2->ptr]) == 0){
+    if(sdscmp(c->argv[1]->ptr, c->argv[2]->ptr) == 0){
         if(nx){
             addReply(c, shared.minus3);
         }else{
@@ -1927,7 +1928,7 @@ static void renameGenericCommand(ledisClient *c, int nx){
         if(nx){
             addReply(c, shared.minus1);
         }else{
-            addReply(c, shared.nokeyerr;
+            addReply(c, shared.nokeyerr);
         }
         return;
     }
@@ -1939,7 +1940,7 @@ static void renameGenericCommand(ledisClient *c, int nx){
         if(nx){
             //存在key则放弃
             decrRefCount(o);
-            addReplySds(c, shared.zero);
+            addReply(c, shared.zero);
             return;
         }else{
             dictReplace(c->dict, c->argv[2], o);
@@ -2482,7 +2483,7 @@ static int syncRead(int fd, void *ptr, ssize_t size, int timeout){
 /**
  * 内部使用syncRead，但每次只读一行（遇到\r\n或\n结尾就算完）
  */ 
-static int sycnReadLine(int fd, char *ptr, ssize_t size, int timeout){
+static int syncReadLine(int fd, char *ptr, ssize_t size, int timeout){
     ssize_t nread = 0;
     //一个一个字符读
     while(size){
@@ -2530,7 +2531,7 @@ static void syncCommand(ledisClient *c){
         len -= nread;
         if(syncWrite(c->fd, buf, nread, 5) == -1) goto closeconn;
     }
-    if(sycnWrite(c->fd, "\r\n", 2, 5) == -1) goto closeconn;
+    if(syncWrite(c->fd, "\r\n", 2, 5) == -1) goto closeconn;
     close(fd);
     c->flags |= LEDIS_SLAVE;
     c->slaveseldb = 0;
@@ -2572,7 +2573,7 @@ static int syncWithMaster(void){
     int dumpsize = atoi(buf);
     ledisLog(LEDIS_NOTICE, "Receiving %d bytes data dump from MASTER", dumpsize);
     //生成ldb文件临时文件名
-    snprintf(tmpfile, 256, "temp-%d.%ld.ldb", (int)time(NULL), (int)random());
+    snprintf(tmpfile, 256, "temp-%d.%ld.ldb", (int)time(NULL), (long int)random());
     int dfd = open(tmpfile, O_CREAT|O_WRONLY, 0644);
     if(dfd == -1){
         close(fd);

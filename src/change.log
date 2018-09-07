@@ -5,8 +5,7 @@ beta-6变化
 新功能：
 1.主从复制。（原理是一开始从直接复制主的dump文件，然后当主进行了修改后，模拟TCP-Client给所有的从，发相同的command，让从自己再次执行，不太可靠）
 2.benckmark性能测试程序。
-修改BUG：
-1.
+修改BUG：无，但基本都随着command的修改都改了一遍。
 代码调整：
 1.anet增加了nonblock的client选项，同时也开启了REUSEADDR选项。
 2.anetTcpServer的backlog参数由5提高到32。

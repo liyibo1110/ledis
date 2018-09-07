@@ -37,10 +37,10 @@ static struct config{
     aeEventLoop *el;
     char *hostip;
     int hostport;
-    int keepalive;
+    int keepalive;  //可以复用
     long long start;
     long long totlatency;
-    int *latency;
+    int *latency;   //动态数组，统计每个运行时间的各自总数
     list *clients;
     int quiet;  //安静模式
     int loop;   //是否永远循环
@@ -93,12 +93,101 @@ static void freeAllClients(void){
     while(ln){
         next = ln->next;
         freeClient(ln->value);
-        ln = ln->next;
+        ln = next;
     }
 }
 
+/**
+ * 重置client使得下一次还能用，只有开启了keepalive才会被调用
+ */ 
 static void resetClient(client c){
+    aeDeleteFileEvent(config.el, c->fd, AE_WRITABLE);
+    aeDeleteFileEvent(config.el, c->fd, AE_READABLE);
+    aeCreateFileEvent(config.el, c->fd, AE_WRITABLE, writeHandler, c, NULL);
+    sdsfree(c->ibuf);
+    c->ibuf = sdsempty();
+    c->readlen = (c->replytype == REPLY_BULK) ? -1 : 0;
+    c->written = 0;
+    c->state = CLIENT_SENDQUERY;
+    c->start = mstime();
+}
 
+/**
+ * 处理单个client完成后的收尾
+ */ 
+static void clientDone(client c){
+    config.donerequests++;
+    long long latency = mstime() - c->start;
+    if(latency > MAX_LATENCY) latency = MAX_LATENCY;
+    config.latency[latency]++;  //相应时间点统计值加1
+
+    //都完事了
+    if(config.donerequests == config.requests){
+        freeClient(c);
+        aeStop(config.el);
+        return;
+    }
+    if(config.keepalive){
+        resetClient(c);
+    }else{
+        config.liveclients--;
+        createMissingClients(c);
+        config.liveclients++;
+        freeClient(c);
+    }
+}
+
+static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask){
+    
+    char buf[1024];
+    client c = privdata;
+    //都在privdata里面，外面的没用
+    LEDIS_NOTUSED(el);
+    LEDIS_NOTUSED(fd);
+    LEDIS_NOTUSED(mask);
+
+    int nread = read(c->fd, buf, 1024);
+    if(nread == -1){
+        fprintf(stderr, "Reading from socket: %s\n", strerror(errno));
+        return;
+    }
+    if(nread == 0){
+        fprintf(stderr, "EOF from client\n");
+        freeClient(c);
+        return;
+    }
+    c->ibuf = sdscatlen(c->ibuf, buf, nread);
+
+    if(c->replytype == REPLY_INT || 
+        c->replytype == REPLY_RETCODE || 
+        (c->replytype == REPLY_BULK && c->readlen == -1)){
+
+        char *p;
+        if((p = strchr(c->ibuf, '\n')) != NULL){
+            if(c->replytype == REPLY_BULK){
+                //如果是bulk类型，说明是类似这样的5\r\nhello\r\n，需要分别取长度和信息本身
+                *p = '\0';
+                *(p-1) = '\0';  //将reply字符串中的\r\n去掉
+                if(memcmp(c->ibuf, "nil", 3) == 0){
+                    clientDone(c);
+                    return;
+                }
+                //如果返回不是nil，则尝试读取bulk字符串
+                c->readlen = atoi(c->ibuf)+2;
+                c->ibuf = sdsrange(c->ibuf, (p-c->ibuf)+1, -1);
+                //这里不return
+            }else{  //普通类型，类似这样hello\r\n
+                c->ibuf = sdstrim(c->ibuf, "\r\n");
+                clientDone(c);
+                return;
+            }
+        }
+
+        //判断bulk类型读取是否完整
+        if((unsigned)c->readlen == sdslen(c->ibuf)){
+            clientDone(c);
+        }
+    }
 }
 
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask){
@@ -139,6 +228,7 @@ static client createClient(void){
     char err[ANET_ERR_LEN];
 
     c->fd = anetTcpNonBlockConnect(err, config.hostip, config.hostport);
+    //printf("c->fd=%d\n", c->fd);
     if(c->fd == ANET_ERR){
         free(c);
         fprintf(stderr, "Connect: %s\n", err);
@@ -152,6 +242,7 @@ static client createClient(void){
     c->written = 0;
     c->state = CLIENT_CONNECTING;
 
+    aeCreateFileEvent(config.el, c->fd, AE_WRITABLE, writeHandler, c, NULL);
     config.liveclients++;
     listAddNodeTail(config.clients, c);
     return c;
@@ -171,6 +262,35 @@ static void createMissingClients(client c){
     }
 }
 
+static void showLatencyReport(char *title){
+    
+    //算出平均每秒处理了多少req
+    float reqpersec = (float)config.donerequests/((float)config.totlatency/1000);
+    if(!config.quiet){
+        //输出基础信息
+        printf("====== %s ======\n", title);
+        printf("  %d requests completed in %2.f seconds\n", config.donerequests, 
+                (float)config.totlatency/1000);
+        printf("  %d parallel clients\n", config.numclients);
+        printf("  %d bytes payload\n", config.datasize);
+        printf("  keep alive: %d\n", config.keepalive);
+        printf("\n");
+        //输出bitmap结构
+        float perc;
+        int seen = 0;
+        for(int i = 0; i < MAX_LATENCY; i++){
+            if(config.latency[i]){
+                seen += config.latency[i];  //追加client数
+                perc = ((float)seen*100)/config.donerequests;   //该时间的client，占所有完成的client比值
+                printf("%.2f%% <= %d milliseconds\n", perc, i);
+            }
+        }
+        printf("%.2f requests per second\n", reqpersec);
+    }else{
+        printf("%s: %.2f requests per second\n", title, reqpersec);
+    }
+}
+
 /**
  * 预处理
  */ 
@@ -185,6 +305,8 @@ static void prepareForBenchmark(void){
  */ 
 static void endBenchmark(char *title){
     config.totlatency = mstime() - config.start;
+    showLatencyReport(title);
+    freeAllClients();
 } 
 
 void parseOptions(int argc, char **argv){
@@ -263,8 +385,68 @@ int main(int argc, char **argv){
         printf("WARING: keepalive disabled, you probably need 'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse' in order to use a lot of clients/requests\n");
     }
 
+    client c;
     do{
+        /*========== 测试SET ==========*/
+        prepareForBenchmark();
+        c = createClient(); //创建一个client
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscatprintf(c->obuf, "SET foo %d\r\n", config.datasize);
+        {
+            char *data = malloc(config.datasize+2); //还有\r\n
+            memset(data, 'x', config.datasize); //用字符x填充datasize个
+            data[config.datasize] = '\r';
+            data[config.datasize+1] = '\n';
+            c->obuf = sdscatlen(c->obuf, data, config.datasize+2);
+        }
+        c->replytype = REPLY_RETCODE;   //设置返回的类型
+        createMissingClients(c);    //弄出剩余的client
+        aeMain(config.el);  //开始执行，直到都完成才会返回
+        endBenchmark("SET");
 
+        /*========== 测试GET ==========*/
+        prepareForBenchmark();
+        c = createClient();
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscat(c->obuf, "GET foo\r\n");
+        c->replytype = REPLY_BULK;  //返回类型是bulk了
+        c->readlen = -1;
+        createMissingClients(c);
+        aeMain(config.el);
+        endBenchmark("GET");
+
+        /*========== 测试INCR ==========*/
+        prepareForBenchmark();
+        c = createClient();
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscat(c->obuf, "INCR counter\r\n");
+        c->replytype = REPLY_INT;  //返回类型是int了
+        createMissingClients(c);
+        aeMain(config.el);
+        endBenchmark("INCR");
+
+        /*========== 测试LPUSH ==========*/
+        prepareForBenchmark();
+        c = createClient();
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscat(c->obuf, "LPUSH mylist 3\r\nbar\r\n");
+        c->replytype = REPLY_INT;  //返回类型是int了
+        createMissingClients(c);
+        aeMain(config.el);
+        endBenchmark("LPUSH");
+
+        /*========== 测试LPOP ==========*/
+        prepareForBenchmark();
+        c = createClient();
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscat(c->obuf, "LPOP mylist\r\n");
+        c->replytype = REPLY_BULK;  //返回类型是bulk了
+        c->readlen = -1;
+        createMissingClients(c);
+        aeMain(config.el);
+        endBenchmark("LPOP");
+
+        printf("\n");
     }while(config.loop);
 
     return EXIT_SUCCESS;

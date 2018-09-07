@@ -3,11 +3,13 @@ CFLAGS ?= -O2 -Wall -W -DSDS_ABORT_ON_OOM
 CCOPT = $(CFLAGS)
 
 OBJ = adlist.o ae.o anet.o dict.o sds.o ledis.o 
+BENCHOBJ = ae.o anet.o benchmark.o sds.o adlist.o
+BENCHNAME = ledis-benchmark.out
 PRGNAME = ledis-server.out
 CLIENTOBJ = anet.o client.o
 CLIENTNAME = ledis-client.out
 
-all: ledis-server.out ledis-client.out
+all: ledis-server.out ledis-benchmark.out ledis-client.out
 
 adlist.o: adlist.c adlist.h
 ae.o: ae.c ae.h
@@ -29,5 +31,8 @@ ledis-server.out: $(OBJ)
 	@echo "Launch the ledis server with ./ledis-server.out ./ledis.conf"
 	@echo ""
 
+ledis-benchmark.out: $(BENCHOBJ)
+	$(CC) -o $(BENCHNAME) $(CCOPT) $(DEBUG) $(BENCHOBJ)
+
 clean:
-	rm -rf $(PRGNAME) $(CLIENTNAME) *.o
+	rm -rf $(PRGNAME) $(CLIENTNAME) $(BENCHNAME) *.o

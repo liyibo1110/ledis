@@ -197,15 +197,15 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
         //尝试遍历并根据mask，加入相应的监控列表
         while(fe != NULL){
             if(fe->mask & AE_READABLE)  {
-                printf("fd: %d has put rfds\n", fe->fd);
+                //printf("fd: %d has put rfds\n", fe->fd);
                 FD_SET(fe->fd, &rfds);
             }
             if(fe->mask & AE_WRITABLE)  {
-                printf("fd: %d has put wfds\n", fe->fd);
+                //printf("fd: %d has put wfds\n", fe->fd);
                 FD_SET(fe->fd, &wfds);
             }
             if(fe->mask & AE_EXCEPTION) {
-                printf("fd: %d has put efds\n", fe->fd);
+                //printf("fd: %d has put efds\n", fe->fd);
                 FD_SET(fe->fd, &efds);
             }
             //寻找最大的fd，为了满足select
@@ -252,7 +252,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
 
         //tvp时间有可能是负数（例如第一次启动在loadDb操作花费了超过1s的时间），这样retval会为-1,程序并没有处理错误，而是继续
         int retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
-        printf("select is over, retval=%d\n", retval);
+        //printf("select is over, retval=%d\n", retval);
         if(retval > 0){
 
             //还得遍历event集合，找出哪些就绪了
@@ -315,7 +315,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags){
             }
         }
     }
-    printf("processed=%d\n", processed);
+    //printf("processed=%d\n", processed);
     return processed;   //本次一共处理了多少个fileEvent
 }
 
