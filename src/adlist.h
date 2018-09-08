@@ -13,7 +13,7 @@ typedef struct list{
     void *(*dup)(void *ptr);    //复制函数实现
     void (*free)(void *ptr);    //释放函数实现
     int (*match)(void *ptr, void *key); //比较函数实现
-    int len;
+    unsigned int len;
 } list;
 
 typedef struct listIter{

@@ -387,6 +387,16 @@ int main(int argc, char **argv){
 
     client c;
     do{
+        /*========== 测试PING ==========*/
+        prepareForBenchmark();
+        c = createClient(); //创建一个client
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscat(c->obuf, "PING\r\n");
+        c->replytype = REPLY_RETCODE;   //设置返回的类型
+        createMissingClients(c);    //弄出剩余的client
+        aeMain(config.el);  //开始执行，直到都完成才会返回
+        endBenchmark("PING");
+        
         /*========== 测试SET ==========*/
         prepareForBenchmark();
         c = createClient(); //创建一个client

@@ -26,6 +26,8 @@
 #include "dict.h"
 #include "adlist.h"
 
+#define LEDIS_VERSION "0.07"
+
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
 #define LEDIS_MAXIDLETIME   (60*5)  //默认客户端timeout时长
@@ -71,6 +73,15 @@
 /*========== list相关 ==========*/
 #define LEDIS_HEAD  0   //链表遍历方向
 #define LEDIS_TAIL  1
+
+/*========== 排序相关 ==========*/
+#define LEDIS_SORT_GET 0
+#define LEDIS_SORT_DEL 1
+#define LEDIS_SORT_INCR 2
+#define LEDIS_SORT_DECR 3
+#define LEDIS_SORT_ASC 4
+#define LEDIS_SORT_DESC 5
+#define LEDIS_SORTKEY_MAX 1024
 
 /*========== 日志级别 ==========*/
 #define LEDIS_DEBUG 0
@@ -122,27 +133,36 @@ struct ledisServer{
 
     char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
+    int cronloops;
+    list *objfreelist;  //复用lobj对象的池子链表
+    time_t lastsave;
+
+    /*======配置相关======*/
     int verbosity;  //log的输出等级
     int glueoutputbuf;
-    int cronloops;
-    int maxidletime;
-
-    int dbnum;
-    list *objfreelist;  //复用lobj对象的池子链表
-    int bgsaveinprogress;   //是否正在bgsave，其实是个bool
-    time_t lastsave;
-    struct saveparam *saveparams;
     
+    int maxidletime;
+    int dbnum;
+    int daemonize;
+    int bgsaveinprogress;   //是否正在bgsave，其实是个bool
+    
+    struct saveparam *saveparams;
     int saveparamslen;
     char *logfile;
     char *bindaddr;
+    char *dbfilename;
 
-    //主从相关
+    /*======主从相关======*/
     int isslave;
     char *masterhost;
     int masterport;
     ledisClient *master;
     int replstate;
+    
+    /*======排序相关======*/
+    int sort_desc;
+    int sort_alpha;
+    int sort_bypattern;
 };
 
 //定义每个ledis命令的实际函数形态
@@ -156,11 +176,25 @@ struct ledisCommand{
     int flags;   //是块类命令，还是内联命令
 };
 
+typedef struct _ledisSortObject{
+    lobj *obj;
+    union{
+        double score;
+        lobj *cmpobj;
+    } u;
+} ledisSortObject;
+
+typedef struct _ledisSortOperation{
+    int type;
+    lobj *pattern;
+} ledisSortOperation;
+
 //定义会用到的lobj可复用对象
 struct sharedObjectsStruct{
     lobj *crlf, *ok, *err, *zerobulk, *nil, *zero, *one, *pong, *space,
     *minus1, *minus2, *minus3, *minus4,
     *wrongtypeerr, *nokeyerr, *wrongtypeerrbulk, *nokeyerrbulk,
+    *syntaxerr, *syntaxerrbulk,
     *select0, *select1, *select2, *select3, *select4,
     *select5, *select6, *select7, *select8, *select9;
 } shared;
@@ -227,8 +261,14 @@ static void sremCommand(ledisClient *c);
 static void sismemberCommand(ledisClient *c);
 static void scardCommand(ledisClient *c);
 static void sinterCommand(ledisClient *c);
+static void sinterstoreCommand(ledisClient *c);
 
 static void syncCommand(ledisClient *c);
+static void flushdbCommand(ledisClient *c);
+static void flushallCommand(ledisClient *c);
+static void sortCommand(ledisClient *c);
+static void lremCommand(ledisClient *c);
+static void versionCommand(ledisClient *c);
 
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
@@ -249,12 +289,14 @@ static struct ledisCommand cmdTable[] = {
     {"lset",lsetCommand,4,LEDIS_CMD_BULK},
     {"lrange",lrangeCommand,4,LEDIS_CMD_INLINE},
     {"ltrim",ltrimCommand,4,LEDIS_CMD_INLINE},
-    
+    {"lrem",lremCommand,4,LEDIS_CMD_BULK},
+
     {"sadd",saddCommand,3,LEDIS_CMD_BULK},
     {"srem",sremCommand,3,LEDIS_CMD_BULK},
     {"sismember",sismemberCommand,3,LEDIS_CMD_BULK},
     {"scard",scardCommand,2,LEDIS_CMD_INLINE},
     {"sinter",sinterCommand,-2,LEDIS_CMD_INLINE},
+    {"sinterstore",sinterstoreCommand,-3,LEDIS_CMD_INLINE},
     {"smembers",sinterCommand,2,LEDIS_CMD_INLINE},
 
     {"incrby",incrbyCommand,2,LEDIS_CMD_INLINE},
@@ -275,6 +317,10 @@ static struct ledisCommand cmdTable[] = {
     {"lastsave",lastsaveCommand,1,LEDIS_CMD_INLINE},
     {"type",typeCommand,2,LEDIS_CMD_INLINE},
     {"sync",syncCommand,1,LEDIS_CMD_INLINE},
+    {"flushdb",flushdbCommand,1,LEDIS_CMD_INLINE},
+    {"flushall",flushallCommand,1,LEDIS_CMD_INLINE},
+    {"sort",sortCommand,-2,LEDIS_CMD_INLINE},
+    {"version",versionCommand,1,LEDIS_CMD_INLINE},
     {"",NULL,0,0}
 };
 
@@ -585,7 +631,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
             if(server.dirty >= sp->changes && now - server.lastsave > sp->seconds){
                 ledisLog(LEDIS_NOTICE, "%d changes in %d seconds. Saving...",
                             sp->changes, sp->seconds);
-                saveDbBackground("dump.ldb");
+                saveDbBackground(server.dbfilename);
                 break;
             }
         }
@@ -628,7 +674,8 @@ static void createSharedObjects(void){
     shared.wrongtypeerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.wrongtypeerr->ptr)+2, shared.wrongtypeerr->ptr));
     shared.nokeyerr = createObject(LEDIS_STRING, sdsnew("-ERR no such key\r\n"));
     shared.nokeyerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.nokeyerr->ptr)+2, shared.nokeyerr->ptr));
-
+    shared.syntaxerr = createObject(LEDIS_STRING, sdsnew("-ERR syntax error\r\n"));
+    shared.syntaxerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.syntaxerr->ptr)+2, shared.syntaxerr->ptr));
     shared.space = createObject(LEDIS_STRING, sdsnew(" "));
     shared.select0 = createStringObject("select 0\r\n", 10);
     shared.select1 = createStringObject("select 1\r\n", 10);
@@ -674,6 +721,8 @@ static void initServerConfig(){
     server.logfile = NULL;  //到后面再设定
     server.bindaddr = NULL;
     server.glueoutputbuf = 1;
+    server.daemonize = 0;
+    server.dbfilename = "dump.ldb";
 
     ResetServerSaveParams();
     //给默认的配置
@@ -840,6 +889,16 @@ static void loadServerConfig(char *filename){
                 server.glueoutputbuf = 1;
             }else if(!strcmp(argv[1], "no")){
                 server.glueoutputbuf = 0;
+            }else{
+                err = "argument must be 'yes' or 'no'";
+                goto loaderr;
+            }
+        }else if(!strcmp(argv[0], "daemonize") && argc == 2){
+            sdstolower(argv[1]);
+            if(!strcmp(argv[1], "yes")){
+                server.daemonize = 1;
+            }else if(!strcmp(argv[1], "no")){
+                server.daemonize = 0;
             }else{
                 err = "argument must be 'yes' or 'no'";
                 goto loaderr;
@@ -1881,7 +1940,7 @@ static void typeCommand(ledisClient *c){
 }
 
 static void saveCommand(ledisClient *c){
-    if(saveDb("dump.ldb") == LEDIS_OK){
+    if(saveDb(server.dbfilename) == LEDIS_OK){
         addReply(c, shared.ok);
     }else{
         addReply(c, shared.err);
@@ -1893,7 +1952,7 @@ static void bgsaveCommand(ledisClient *c){
         addReplySds(c, sdsnew("-ERR background save already in progress\r\n"));
         return;
     }
-    if(saveDbBackground("dump.ldb") == LEDIS_OK){
+    if(saveDbBackground(server.dbfilename) == LEDIS_OK){
         addReply(c, shared.ok);
     }else{
         addReply(c, shared.err);
@@ -1902,7 +1961,7 @@ static void bgsaveCommand(ledisClient *c){
 
 static void shutdownCommand(ledisClient *c){
     ledisLog(LEDIS_WARNING, "User requested shutdown, saving DB...");
-    if(saveDb("dump.ldb") == LEDIS_OK){
+    if(saveDb(server.dbfilename) == LEDIS_OK){
         ledisLog(LEDIS_NOTICE, "server exit now, bye bye...");
         exit(EXIT_SUCCESS);
     }else{
@@ -2251,6 +2310,45 @@ static void ltrimCommand(ledisClient *c){
     }
 }
 
+static void lremCommand(ledisClient *c){
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.minus1);
+        return;
+    }else{
+        lobj *o = dictGetEntryVal(de);
+        if(o->type != LEDIS_LIST){
+            addReply(c, shared.minus2);
+            return;
+        }else{
+            list *list = o->ptr;
+            int removed = 0;
+            int toremove = atoi(c->argv[2]->ptr);
+            int fromtail = 0;
+            if(toremove < 0){   //如果count参数为负，先变回正数，然后从尾部遍历
+                toremove = -toremove;
+                fromtail = 1;
+            }
+            //首元素准备遍历
+            listNode *ln = fromtail ? list->tail : list->head;
+            listNode *next; //删除用
+            while(ln){
+                next = fromtail ? ln->prev : ln->next;
+                lobj *ele = listNodeValue(ln);
+                if(sdscmp(ele->ptr, c->argv[3]->ptr) == 0){
+                    listDelNode(list, ln);
+                    server.dirty++;
+                    removed++;
+                    //如果count不为0,则删到count个元素就停止
+                    if(toremove && removed == toremove) break;
+                }
+                ln = next;
+            }
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", removed));
+        }
+    }
+}
+
 /*====================================== SET相关 ===============================*/
 
 static void saddCommand(ledisClient *c){
@@ -2353,32 +2451,43 @@ static int qsortCompareSetsByCardinality(const void *s1, const void *s2){
  * 取不同SET的交集，因此c->argc至少要为3
  * 此command还兼容smember命令，即只传一个SET的KEY，让取交集的for直接跳过，从此造成交集等于自身SET的情况，并依次返回
  */ 
-static void sinterCommand(ledisClient *c){
-    dict **dv = malloc(sizeof(dict*)*(c->argc-1));
+static void sinterGenericCommand(ledisClient *c, lobj **setskeys, int setsnum, lobj *dstkey){
+    
+    lobj *lenobj = NULL, *dstset = NULL;
+    dict **dv = malloc(sizeof(dict*)*setsnum);
     if(!dv) oom("sinterCommand");
     //尝试处理参数传来的每个SET
-    for(int i = 0; i < c->argc-1; i++){
-        dictEntry *de = dictFind(c->dict, c->argv[i+1]);
+    for(int i = 0; i < setsnum; i++){
+        dictEntry *de = dictFind(c->dict, setskeys[i]);
         if(de == NULL){ //每个key参数必须要有效
             free(dv);
-            addReply(c, shared.nil);
+            addReply(c, dstkey ? shared.nokeyerr : shared.nil);
             return;
         }
         lobj *setobj = dictGetEntryVal(de);
         if(setobj->type != LEDIS_SET){
             free(dv);
-            addReply(c, shared.wrongtypeerrbulk);
+            addReply(c, dstkey ? shared.wrongtypeerr : shared.wrongtypeerrbulk);
             return;
         }
         dv[i] = setobj->ptr;
     }
 
     //开始处理dict数组中的每个dict了
-    qsort(dv, c->argc-1, sizeof(dict*), qsortCompareSetsByCardinality); //将dv里面的dict按总量排序
-    //返回类型为multi-bulk，但是现在还不知道SET最终交集的数目，所以先输出一个空字符串，在最后会修改实际值
-    lobj *lenobj = createObject(LEDIS_STRING, NULL);
-    addReply(c, lenobj);
-    decrRefCount(lenobj);
+    qsort(dv, setsnum, sizeof(dict*), qsortCompareSetsByCardinality); //将dv里面的dict按总量排序
+    
+    if(!dstkey){    //说明不是sinterstore命令，要返回结果
+        //返回类型为multi-bulk，但是现在还不知道SET最终交集的数目，所以先输出一个空字符串，在最后会修改实际值
+        lenobj = createObject(LEDIS_STRING, NULL);
+        addReply(c, lenobj);
+        decrRefCount(lenobj);
+    }else{  //是sinterstore，则要存储，这里先用空的SET占位，后面再写入交集对象
+        dstset = createSetObject();
+        dictDelete(c->dict, dstkey);
+        dictAdd(c->dict, dstkey, dstset);
+        incrRefCount(dstkey);   //必须要+1，因为dstkey是参数
+    }
+    
     //开始迭代最小的SET，测试每一个在其他SET里面是否存在即可，有一个不在就不算
     dictIterator *di = dictGetIterator(dv[0]);
     if(!di) oom("dictGetIterator");
@@ -2389,22 +2498,157 @@ static void sinterCommand(ledisClient *c){
         lobj *ele;
         int j;
         //从dv的第2个元素开始比
-        for(j = 1; j < c->argc-1; j++){
+        for(j = 1; j < setsnum; j++){
             //没找到直接退出for
             if(dictFind(dv[j], dictGetEntryKey(de)) == NULL) break;
         }
-        if(j != c->argc-1) continue;    //如果不是最后一个SET，说明for是被break出来的，不是后面SET都有这个元素，换下一个元素尝试
+        if(j != setsnum) continue;    //如果不是最后一个SET，说明for是被break出来的，不是后面SET都有这个元素，换下一个元素尝试
         ele = dictGetEntryKey(de);
-        addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", sdslen(ele->ptr)));
-        addReply(c, ele);
-        addReply(c, shared.crlf);
-        cardinality++;
+        if(!dstkey){    //如果不是sinterstore，则需要返回
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", sdslen(ele->ptr)));
+            addReply(c, ele);
+            addReply(c, shared.crlf);
+            cardinality++;
+        }else{  //如果是sinterstore，则直接写进之前建好的SET里
+            dictAdd(dstset->ptr, ele, NULL);
+            incrRefCount(ele);
+        }
+    }
+    dictReleaseIterator(di);
+    if(!dstkey){
+        //因为是单线程的，所以向客户端write的操作要等到下一轮ae迭代了
+        lenobj->ptr = sdscatprintf(sdsempty(), "%d\r\n", cardinality);  
+    }else{  //如果是sinterstore，直接返回ok
+        addReply(c, shared.ok);
+    }
+    free(dv);
+}
+
+static void sinterCommand(ledisClient *c){
+    sinterGenericCommand(c, c->argv+1, c->argc-1, NULL);
+}
+static void sinterstoreCommand(ledisClient *c){
+    sinterGenericCommand(c, c->argv+2, c->argc-2, c->argv[1]);
+}
+
+static void flushdbCommand(ledisClient *c){
+    //清空当前的DB
+    dictEmpty(c->dict);
+    addReply(c, shared.ok);
+    //强制save
+    saveDb(server.dbfilename); 
+}
+
+static void flushallCommand(ledisClient *c);{
+    emptyDb();
+    addReply(c, shared.ok);
+    //强制save
+    saveDb(server.dbfilename);
+}
+
+ledisSortOperation *createSortOperation(int type, lobj *pattern){
+    ledisSortOperation *so = malloc(sizeof(*so));
+    if(!so) oom("createSortOperation");
+    so->type = type;
+    so->pattern = pattern;
+    return so;
+}
+
+/**
+ * 根据给定的pattern（必须带通配符*）和特定片段subst一起当作key，查找并返回对应的val
+ */ 
+lobj *lookupKeyByPattern(dict *dict, lobj *pattern, lobj *subst){
+    
+    //内部匿名struct
+    struct{
+        long len;
+        long free;
+        char buf[LEDIS_SORTKEY_MAX+1];
+    } keyname;
+    
+    sds spat = pattern->ptr;
+    sds ssub = subst->ptr;
+    if(sdslen(spat)+sdslen(ssub)-1 > LEDIS_SORTKEY_MAX) return NULL;
+    //必须要有*
+    char *p = strchr(spat, '*');
+    if(!p) return NULL;
+
+    int prefixlen = p-spat; //pattern中*前面的长度，不包括*本身
+    int sublen = sdslen(ssub);
+    int postfixlen = sdslen(spat) - (prefixlen+1);  //pattern中*后面的长度，不包括*本身
+
+    //构建key的原型，其中subst就是必须要匹配的，没有通配
+    memcpy(keyname.buf, spat, prefixlen);
+    memcpy(keyname.buf+prefixlen, ssub, sublen);
+    memcpy(keyname.buf+prefixlen+sublen, p+1, postfixlen);
+    keyname.buf[prefixlen+sublen+postfixlen] = '\0';
+    keyname.len = prefixlen+sublen+postfixlen;
+
+    lobj keyobj;    //不是指针，直接静态赋值
+    keyobj.refcount = 1;
+    keyobj.type = LEDIS_STRING;
+    keyobj.ptr = ((char*)&keyname)+(sizeof(long)*2);    //直接跳字段获取buf
+
+    dictEntry *de = dictFind(dict, &keyobj);
+    if(!de) return NULL;
+    return dictGetEntryVal(de);
+}
+
+/**
+ * 比较2个sortObject，规则由server的sort不同而不同
+ */ 
+static int sortCompare(const void *s1, const void *s2){
+
+    const ledisSortObject *so1 = s1;
+    const ledisSortObject *so2 = s2;
+    int cmp;
+
+    if(!server.sort_alpha){ //按对象内部的score字段排序
+        if(so1->u.score > so2->u.score){
+            cmp = 1;
+        }else if(so1->u.score < so2->u.score){
+            cmp = -1;
+        }else{
+            cmp = 0;
+        }
+    }else{  //按字母排序
+        if(server.sort_bypattern){
+            if(!so1->u.cmpobj || !so2->u.cmpobj){
+                if(so1->u.cmpobj == so2->u.cmpobj){ //cmpobj都是NULL
+                    cmp = 0;
+                }else if(so1->u.cmpobj == NULL){    //so1的cmpobj是NULL
+                    cmp = -1;
+                }else{  //so2的cmpobj是NULL
+                    cmp = 1;
+                }
+            }else{  //如果里面都有cmpobj，则用这个比
+                //strcoll不同于strcmp，可以识别UTF-8之类的本地设置特定编码
+                cmp = strcoll(so1->u.cmpobj->ptr, so2->u.cmpobj->ptr);  
+            }
+        }else{
+            cmp = strcoll(so1->obj->ptr, so2->obj->ptr);
+        }
+    }
+    return server.sort_desc ? -cmp : cmp;
+}
+
+/**
+ * 超级复杂，为了速度还降低了一些可读性
+ */ 
+static void sortCommand(ledisClient *c){
+
+    dictEntry *de = dictFind(c->dict, c->argv[1]);
+    if(de == NULL){
+        addReply(c, shared.nokeyerrbulk);
+        return;
     }
 
-    //因为是单线程的，所以向客户端write的操作要等到下一轮ae迭代了
-    lenobj->ptr = sdscatprintf(sdsempty(), "%d\r\n", cardinality);  
-    dictReleaseIterator(di);
-    free(dv);
+    
+}
+
+static void versionCommand(ledisClient *c){
+    addReplySds(c, sdsnew(LEDIS_VERSION));
+    addReply(c, shared.crlf);
 }
 
 /*====================================== 主从相关 ===============================*/

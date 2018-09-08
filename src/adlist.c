@@ -17,7 +17,7 @@ list *listCreate(void){
 void listRelease(list *list){
     listNode *next;
     listNode *current = list->head;
-    int len = list->len;
+    unsigned int len = list->len;
     while(len--){   //遍历释放Node
         next = current->next;
         if(list->free) list->free(current->value);  //定义了free则调用

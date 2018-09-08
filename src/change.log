@@ -1,10 +1,21 @@
+beta-7变化
+新的配置：
+1.增加daemonize配置，即后台运行，默认是no（如果开启，会生成/var/log/ledis.pid文件）。
+新功能：
+1.
+修改BUG：
+1.list结构的len，由int改成了unsigned int。
+代码调整：
+1.在所有程序文件顶部，更新了新版的版权说明信息。
+2.benchmark增加了PING命令的测试。
+
 beta-6变化
 新的配置：
 1.增加slaveof，即从服务器可以配置主服务器的ip和port。
 2.增加glueoutputbuf，即合并推送要返回client的消息，默认开启。
 新功能：
 1.主从复制。（原理是一开始从直接复制主的dump文件，然后当主进行了修改后，模拟TCP-Client给所有的从，发相同的command，让从自己再次执行，不太可靠）
-2.benckmark性能测试程序。
+2.benchmark性能测试程序。
 修改BUG：无，但基本都随着command的修改都改了一遍。
 代码调整：
 1.anet增加了nonblock的client选项，同时也开启了REUSEADDR选项。
