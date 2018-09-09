@@ -1,8 +1,13 @@
 beta-7变化
 新的配置：
-1.增加daemonize配置，即后台运行，默认是no（如果开启，会生成/var/log/ledis.pid文件）。
+1.增加daemonize配置，即后台运行，默认是no（如果开启，会生成/var/log/ledis.pid文件），logfile情况也跟着发生了一些变化。
 新功能：
-1.
+1.开始明确增加了当前版本号。
+2.增加了新命令sinterstore，和sinter类似，只是将结果存到指定的新key中。
+3.增加了flushdb和flushall命令，只是简单的清空当前库或者所有库。
+4.增加了lrem命令，可以删除一组LIST结构里的特定值元素。
+5.增加了version命令，简单输出当前版本号。
+6.增加了sort复杂第一版命令，但功能并不完整。
 修改BUG：
 1.list结构的len，由int改成了unsigned int。
 代码调整：

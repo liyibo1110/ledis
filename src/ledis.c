@@ -176,6 +176,7 @@ struct ledisCommand{
     int flags;   //是块类命令，还是内联命令
 };
 
+//进一步封装obj结构，增加了排序相关的辅助字段
 typedef struct _ledisSortObject{
     lobj *obj;
     union{
@@ -2555,7 +2556,7 @@ ledisSortOperation *createSortOperation(int type, lobj *pattern){
 }
 
 /**
- * 根据给定的pattern（必须带通配符*）和特定片段subst一起当作key，查找并返回对应的val
+ * 根据给定的pattern（必须带替代符*）和特定片段subst一起当作key，查找并返回对应的val
  */ 
 lobj *lookupKeyByPattern(dict *dict, lobj *pattern, lobj *subst){
     
@@ -2633,17 +2634,185 @@ static int sortCompare(const void *s1, const void *s2){
 }
 
 /**
- * 超级复杂，为了速度还降低了一些可读性
+ * 超级复杂的一个命令，子功能特别多，为了速度还降低了一些可读性
  */ 
 static void sortCommand(ledisClient *c){
 
+    int outputlen = 0;
+    int desc = 0, alpha = 0;    //默认值
+    int limit_start = 0, limit_count = -1;  //默认值
+    int dontsort = 0;   //不排序标记
+    int getop = 0;  //GET参数计数器，因为只有它可以有多个
+    lobj *sortby = NULL;
     dictEntry *de = dictFind(c->dict, c->argv[1]);
     if(de == NULL){
         addReply(c, shared.nokeyerrbulk);
         return;
     }
+    lobj *sortval = dictGetEntryVal(de);
+    //key对应的val必须是SET或LIST这类集合，只有集合才有排序的需要
+    if(sortval->type != LEDIS_SET && sortval->type != LEDIS_LIST){
+        addReply(c, shared.wrongtypeerrbulk);
+        return;
+    }
 
+    list *operations = listCreate();
+    listSetFreeMethod(operations, free);
+    int j = 2;
+
+    //sort命令看着很像SQL的语法，在这里初步解析各参数，从参数3开始
+    while(j < c->argc){
+        int leftargs = c->argc-j-1; //剩下的参数个数
+        if(!strcasecmp(c->argv[j]->ptr, "asc")){
+            desc = 0;   //正序输出
+        }else if(!strcasecmp(c->argv[j]->ptr, "desc")){
+            desc = 1;   //倒序输出
+        }else if(!strcasecmp(c->argv[j]->ptr, "alpha")){
+            alpha = 1;  //按照字符排序，并不是默认的数值排序
+        }else if(!strcasecmp(c->argv[j]->ptr, "limit") && leftargs >= 2){   //有limit则必须还有offset和count
+            limit_start = atoi(c->argv[j+1]->ptr);
+            limit_count = atoi(c->argv[j+2]->ptr);
+            j+=2;   //limit一共是3个参数，这里要先跳过2个
+        }else if(!strcasecmp(c->argv[j]->ptr, "by") && leftargs >= 1){  //有by则必须还有pattern
+            sortby = c->argv[j+1];  //就是obj类型
+            if(strchr(c->argv[j+1]->ptr, '*') == NULL)  dontsort = 1;
+            j++;    //额外跳过1个
+        }else if(!strcasecmp(c->argv[j]->ptr, "get") && leftargs >= 1){
+            listAddNodeTail(operations, createSortOperation(LEDIS_SORT_GET, c->argv[j+1]));
+            getop++;
+            j++;
+        }else if(!strcasecmp(c->argv[j]->ptr, "del") && leftargs >= 1){
+            listAddNodeTail(operations, createSortOperation(LEDIS_SORT_DEL, c->argv[j+1]));
+            j++;
+        }else if(!strcasecmp(c->argv[j]->ptr, "incr") && leftargs >= 1){
+            listAddNodeTail(operations, createSortOperation(LEDIS_SORT_INCR, c->argv[j+1]));
+            j++;
+        }else if(!strcasecmp(c->argv[j]->ptr, "decr") && leftargs >= 1){
+            listAddNodeTail(operations, createSortOperation(LEDIS_SORT_DECR, c->argv[j+1]));
+            j++;
+        }else{
+            listRelease(operations);
+            addReply(c, shared.syntaxerrbulk);
+            return;
+        }
+        j++;
+    }
+
+    //获取要排序集合的长度
+    int vectorlen = (sortval->type == LEDIS_LIST) ?
+                    listLength((list*)sortval->ptr) :
+                    dictGetHashTableUsed((dict*)sortval->ptr);
     
+    //初始化要排序的中间存储容器
+    ledisSortObject *vector = malloc(sizeof(ledisSortObject)*vectorlen);
+    if(!vector) oom("allocating objects vector for SORT");
+    j = 0;
+    if(sortval->type == LEDIS_LIST){
+        list *list = sortval->ptr;
+        listNode *ln = list->head;
+        while(ln){
+            lobj *ele = ln->value;
+            vector[j].obj = ele;
+            incrRefCount(ele);  //ele是临时变量，容易忘
+            vector[j].u.score = 0;
+            vector[j].u.cmpobj = NULL;
+            ln = ln->next;
+            j++;
+        }
+    }else{
+        dict *set = sortval->ptr;
+        dictIterator *di = dictGetIterator(set);
+        if(!di) oom("dictGetIterator");
+        dictEntry *setele;
+        while((setele = dictNext(di)) != NULL){
+            vector[j].obj = dictGetEntryVal(setele);
+            incrRefCount(vector[j].obj);  //也需要增加引用
+            vector[j].u.score = 0;
+            vector[j].u.cmpobj = NULL;
+            j++;
+        }
+        dictReleaseIterator(di);
+    }
+    assert(j == vectorlen);
+
+    if(dontsort == 0){  //如果没有BY参数，或者有但pattern没有占位符*
+        for(j = 0; j < vectorlen; j++){
+            if(sortby){ //有BY但是pattern没有占位符*
+                //根据pattern寻找pattern动态键的val
+                lobj *byval = lookupKeyByPattern(c->dict, sortby, vector[j].obj);
+                if(!byval || byval->type != LEDIS_STRING) continue;
+                if(alpha){  //按字母排，则
+                    vector[j].u.cmpobj = byval;
+                    incrRefCount(byval);
+                }else{
+                    //其他键的值当作排序参照值
+                    vector[j].u.score = strtod(byval->ptr, NULL);
+                    //不需要考虑alpha，如果是，则自己拿自己排就可以了，不需要画蛇添足再放到cmpobj里
+                }
+            }else{  //没有BY参数
+                if(!alpha){ //只能处理没有开启alpha字母排序的情况，默认将val当作浮点型排序
+                    vector[j].u.score = strtod(vector[j].obj->ptr, NULL);
+                }
+            }
+        }
+    }
+
+    //处理limit中,offset和count
+    int start = (limit_start < 0) ? 0 : limit_start;    //默认是0,即第一个元素，其实就是左边界下标
+    int end = (limit_count < 0) ? vectorlen-1 : start+limit_count-1;    //默认为总量-1，将count转换成右边界下标
+    if(start >= vectorlen){ //start过大
+        start = vectorlen-1;
+        end = vectorlen-2;
+    }
+    if(end >= vectorlen) end = vectorlen-1; //end过大
+
+    if(dontsort == 0){  //如果没有BY参数，或者有但pattern没有占位符*
+        server.sort_desc = desc;
+        server.sort_alpha = alpha;
+        server.sort_bypattern = sortby ? 1 : 0;
+        qsort(vector, vectorlen, sizeof(ledisSortObject), sortCompare);
+    }
+
+    //直接算出最终输出的数目
+    outputlen = getop ? getop*(end-start+1) : end-start+1;
+    addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", outputlen));
+    //输出实际数据
+    for(j = start; j <= end; j++){
+        listNode *ln = operations->head;
+        //输出常规内容
+        if(!getop){
+            addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", sdslen(vector[j].obj->ptr)));
+            addReply(c, vector[j].obj);
+            addReply(c, shared.crlf);
+        }
+        //输出运算参数对应的内容
+        while(ln){
+            ledisSortOperation *sop = ln->value;
+            lobj *val = lookupKeyByPattern(c->dict, sop->pattern, vector[j].obj);
+            if(sop->type == LEDIS_SORT_GET){
+                if(!val || val->type != LEDIS_STRING){
+                    addReply(c, shared.minus1);
+                }else{
+                    addReplySds(c, sdscatprintf(sdsempty(), "%d\r\n", sdslen(val->ptr)));
+                    addReply(c, val);
+                    addReply(c, shared.crlf);
+                }
+            }else if(sop->type == LEDIS_SORT_DEL){
+                //目前没这个功能
+            }
+            ln = ln->next;
+        }
+    }
+
+    //完事了，要清理
+    listRelease(operations);
+    for(j = 0; j < vectorlen; j++){
+        decrRefCount(vector[j].obj);
+        if(sortby && alpha && vector[j].u.cmpobj){
+            decrRefCount(vector[j].u.cmpobj);
+        }
+    }
+    free(vector);
 }
 
 static void versionCommand(ledisClient *c){
@@ -2753,11 +2922,11 @@ static void syncCommand(ledisClient *c){
     time_t start = time(NULL);
     char sizebuf[32];   //dump文件的大小
     ledisLog(LEDIS_NOTICE, "slave ask for syncronization");
-    if(flushClientOutput(c) == LEDIS_ERR || saveDb("dump.ldb") != LEDIS_OK){
+    if(flushClientOutput(c) == LEDIS_ERR || saveDb(server.dbfilename) != LEDIS_OK){
         goto closeconn;
     }
 
-    fd = open("dump.ldb", O_RDONLY);
+    fd = open(server.dbfilename, O_RDONLY);
     if(fd == -1 || fstat(fd, &sb) == -1) goto closeconn;
     int len = sb.st_size;
 
@@ -2847,7 +3016,7 @@ static int syncWithMaster(void){
     }
     close(dfd);
     //生成临时ldb文件完毕
-    if(rename(tmpfile, "dump.ldb") == -1){
+    if(rename(tmpfile, server.dbfilename) == -1){
         ledisLog(LEDIS_WARNING, "Failed trying to rename the temp DB into dump.ldb in MASTER <-> SLAVE synchronization: %s", 
                     strerror(errno));
         unlink(tmpfile);
@@ -2855,7 +3024,7 @@ static int syncWithMaster(void){
         return LEDIS_ERR;
     }
     emptyDb();
-    if(loadDb("dump.ldb") != LEDIS_OK){
+    if(loadDb(server.dbfilename) != LEDIS_OK){
         ledisLog(LEDIS_WARNING, "Failed trying to load the MASTER synchronization DB from disk");
         close(fd);
         return LEDIS_ERR;
@@ -2868,6 +3037,29 @@ static int syncWithMaster(void){
 
 /*====================================== 主函数 ===============================*/
 
+/**
+ * 将当前进程弄成daemon，用的是"古典"方法
+ */ 
+static void daemonize(void){
+    int fd;
+    FILE *fp;
+    if(fork() != 0) exit(EXIT_SUCCESS); //退出主进程
+    setsid();   //创建一个新会话
+
+    if((fd = open("/dev/null", O_RDWR, 0)) != -1){
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if(fd > STDERR_FILENO)  close(fd);
+    }
+    //写prd文件
+    fp = fopen("/var/run/ledis.pid", "w");
+    if(fp){
+        fprintf(fp, "%d\n", getpid());
+        fclose(fp);
+    }
+}
+
 int main(int argc, char *argv[]){
 
     LEDIS_NOTUSED(argc);
@@ -2877,16 +3069,16 @@ int main(int argc, char *argv[]){
     if(argc == 2){  //制定了conf文件
         ResetServerSaveParams();    //清空saveparams字段
         loadServerConfig(argv[1]);
-        ledisLog(LEDIS_NOTICE, "Configuration loaded");
     }else if(argc > 2){
         fprintf(stderr, "Usage: ./ledis-server [/path/to/ledis.conf]\n");
         exit(EXIT_FAILURE);
     }
     //初始化server
     initServer();
-    ledisLog(LEDIS_NOTICE, "Server started");
+    if(server.daemonize) daemonize();
+    ledisLog(LEDIS_NOTICE, "Server started, LEDIS version ", LEDIS_VERSION);
     //尝试恢复数据库dump.ldb文件
-    if(loadDb("dump.ldb") == LEDIS_OK){
+    if(loadDb(server.dbfilename) == LEDIS_OK){
         ledisLog(LEDIS_NOTICE, "DB loaded from disk");
     }
     //假定恢复db用了5s
