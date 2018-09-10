@@ -1,9 +1,10 @@
 #include "adlist.h"
+#include "zmalloc.h"
 #include <stdlib.h>
 #include <stdio.h>
 
 list *listCreate(void){
-    list *l = malloc(sizeof(*l));
+    list *l = zmalloc(sizeof(*l));
     if(l == NULL) return NULL;
     l->head = NULL;
     l->tail = NULL;
@@ -21,14 +22,14 @@ void listRelease(list *list){
     while(len--){   //遍历释放Node
         next = current->next;
         if(list->free) list->free(current->value);  //定义了free则调用
-        free(current);
+        zfree(current);
         current = next;
     }
-    free(list);
+    zfree(list);
 }
 
 list *listAddNodeHead(list *list, void *value){
-    listNode *node = malloc(sizeof(*node));
+    listNode *node = zmalloc(sizeof(*node));
     if(node == NULL) return NULL;
     node->value = value;
     if(list->len == 0){ //链表如果为空
@@ -47,7 +48,7 @@ list *listAddNodeHead(list *list, void *value){
 }
 
 list *listAddNodeTail(list *list, void *value){
-    listNode *node = malloc(sizeof(*node));
+    listNode *node = zmalloc(sizeof(*node));
     if(node == NULL) return NULL;
     node->value = value;
     if(list->len == 0){ //链表如果为空
@@ -78,12 +79,12 @@ void listDelNode(list *list, listNode *node){
         list->tail = node->prev;
     }
     if(list->free)  list->free(node->value);
-    free(node);
+    zfree(node);
     list->len--;
 }
 
 listIter *listGetIterator(list *list, int direction){
-    listIter *iter = malloc(sizeof(*iter)); 
+    listIter *iter = zmalloc(sizeof(*iter)); 
     if(iter == NULL) return NULL;
     //指定第一个元素
     if(direction == AL_START_HEAD){
@@ -108,7 +109,7 @@ listNode *listNextElement(listIter *iter){
 }
 
 void listReleaseIterator(listIter *iter){
-    free(iter); //释放自己就够了，不需要释放node
+    zfree(iter); //释放自己就够了，不需要释放node
 }
 
 list *listDup(list *orig){

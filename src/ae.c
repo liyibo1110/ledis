@@ -1,4 +1,5 @@
 #include "ae.h"
+#include "zmalloc.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -14,7 +15,7 @@
  * 新建并初始化一个EventLoop，都没有值
  */ 
 aeEventLoop *aeCreateEventLoop(void){
-    aeEventLoop *eventLoop = malloc(sizeof(*eventLoop));
+    aeEventLoop *eventLoop = zmalloc(sizeof(*eventLoop));
     if(eventLoop == NULL)   return NULL;
     eventLoop->fileEventHead = NULL;
     eventLoop->timeEventHead = NULL;
@@ -27,7 +28,7 @@ aeEventLoop *aeCreateEventLoop(void){
  * 释放EventLoop
  */ 
 void aeDeleteEventLoop(aeEventLoop *eventLoop){
-    free(eventLoop);
+    zfree(eventLoop);
 }
 
 /**
@@ -43,7 +44,7 @@ void aeStop(aeEventLoop *eventLoop){
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
                         aeFileProc *proc, void *clientData, 
                         aeEventFinalizerProc *finalizerProc){
-    aeFileEvent *fe = malloc(sizeof(*fe));
+    aeFileEvent *fe = zmalloc(sizeof(*fe));
     if(fe == NULL)  return AE_ERR;
     fe->fd = fd;
     fe->mask = mask;
@@ -73,7 +74,7 @@ void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask){
             if(fe->finalizeProc){
                 fe->finalizeProc(eventLoop, fe->clientData);
             }
-            free(fe);
+            zfree(fe);
             return;
         }
         //不是就尝试下一个，需要记住上一个结构
@@ -119,7 +120,7 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long milliseconds,
                         aeEventFinalizerProc *finalizerProc){
     
     long long id = eventLoop->timeEventNextId++;    //第一个id是从0开始
-    aeTimeEvent *te = malloc(sizeof(*te));
+    aeTimeEvent *te = zmalloc(sizeof(*te));
     if(te == NULL)  return AE_ERR;
     te->id = id;
     aeAddMillisecondsToNow(milliseconds, &te->when_sec, &te->when_ms);
@@ -149,7 +150,7 @@ int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id){
             if(te->finalizeProc){
                 te->finalizeProc(eventLoop, te->clientData);
             }
-            free(te);
+            zfree(te);
             return AE_OK;
         }
         //不是就尝试下一个，需要记住上一个结构

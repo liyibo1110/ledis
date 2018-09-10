@@ -1,4 +1,5 @@
 #include "dict.h"
+#include "zmalloc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +21,7 @@ static void _dictPanic(const char *fmt, ...){
 
 /*------------------------内存函数-----------------------*/
 static void *_dictAlloc(int size){  //为什么不是size_t？
-    void *p = malloc(size);
+    void *p = zmalloc(size);
     if(p == NULL){
         _dictPanic("Out of memory");
     }
@@ -28,7 +29,7 @@ static void *_dictAlloc(int size){  //为什么不是size_t？
 }  
 
 static void _dictFree(void *ptr){
-    free(ptr);
+    zfree(ptr);
 }
 
 /*-----------------------私有函数原型--------------------*/
