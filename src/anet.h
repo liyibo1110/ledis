@@ -16,7 +16,7 @@ int anetTcpNoDelay(char *err, int fd);
 int anetTcpKeepAlive(char *err, int fd);
 int anetSetSendBuffer(char *err, int fd, int bufferSize);
 
-int anetRead(int fd, void *buf, int count);
-int anetWrite(int fd, void *buf, int count);
+int anetRead(int fd, char *buf, int count);
+int anetWrite(int fd, char *buf, int count);
 
 #endif

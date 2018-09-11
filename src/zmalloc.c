@@ -11,13 +11,13 @@ void *zmalloc(size_t size){
     //在空间size_t的长度里，先写入size的实际大小
     *((size_t*)ptr) = size;
     used_memory += size+sizeof(size_t); //记录增加的大小
-    return ptr+sizeof(size_t);  //返回剩余空间的首地址
+    return (char*)ptr+sizeof(size_t);  //返回剩余空间的首地址
 }
 
 void *zrealloc(void *ptr, size_t size){
 
     if(ptr == NULL) return zmalloc(size);
-    void *realptr = ptr-sizeof(size_t); //这才是头
+    void *realptr = (char*)ptr-sizeof(size_t); //这才是头
     size_t oldsize = *((size_t*)realptr);   //原来的size值
     void *newptr = realloc(realptr, size+sizeof(size_t));
     if(!newptr) return NULL;
@@ -25,13 +25,13 @@ void *zrealloc(void *ptr, size_t size){
     *((size_t*)newptr) = size;
     used_memory -= oldsize;
     used_memory += size;
-    return newptr+sizeof(size_t);
+    return (char*)newptr+sizeof(size_t);
 }
 
 void zfree(void *ptr){
 
     if(ptr == NULL) return; 
-    void *realptr = ptr-sizeof(size_t); //这才是头
+    void *realptr = (char*)ptr-sizeof(size_t); //这才是头
     size_t oldsize = *((size_t*)realptr);   //原来的size值
     used_memory -= oldsize+sizeof(size_t);
     free(realptr);

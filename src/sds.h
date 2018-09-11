@@ -8,7 +8,7 @@ typedef char *sds;  //只是起个别名，这样普通C字符串也可以当做
 struct sdshdr{
     long len;   //字符串实际长度，不包括结尾
     long free;  //字符串容器剩余空间
-    char buf[0];    //实际容器，一开始空间为0，因此sizeof(struct sdshdr)的结果是8
+    char buf[];    //实际容器，一开始空间为0，因此sizeof(struct sdshdr)的结果是8
 };
 
 //开始定义函数接口

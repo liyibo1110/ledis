@@ -1,3 +1,5 @@
+#include "fmacros.h"
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -12,6 +14,7 @@
 #include <fcntl.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <limits.h>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -28,8 +31,9 @@
 #include "dict.h"
 #include "adlist.h"
 #include "zmalloc.h"
+#include "lzf.h"
 
-#define LEDIS_VERSION "0.08"
+#define LEDIS_VERSION "0.09"
 
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
@@ -41,6 +45,7 @@
 #define LEDIS_CONFIGLINE_MAX    1024    //1k
 #define LEDIS_OBJFREELIST_MAX 1000000 //obj池子最大数目
 #define LEDIS_MAX_SYNC_TIME 60 //
+#define LEDIS_EXPIRELOOKUPS_PER_CRON 100    //每秒尝试最多淘汰100个key
 
 /*========== Hash table 相关==========*/
 #define LEDIS_HT_MINFILL    10  //dict实际占用百分数，小于这个比率就会尝试再收缩（前提是扩张过）
@@ -60,8 +65,25 @@
 #define LEDIS_LIST  1
 #define LEDIS_SET   2
 #define LEDIS_HASH  3
+
+//只会用在持久化功能里
+#define LEDIS_EXPIRETIME 253
 #define LEDIS_SELECTDB  254
 #define LEDIS_EOF   255
+
+/*========== 持久化格式相关 ==========*/
+/* 定义了4种存储格式，用前2位来识别，分别是6位/14位/32位/其他 */
+#define LEDIS_RDB_6BITLEN 0
+#define LEDIS_RDB_14BITLEN 1
+#define LEDIS_RDB_32BITLEN 2
+#define LEDIS_RDB_ENCVAL 3
+#define LEDIS_RDB_LENERR UINT_MAX
+
+/* 定义了4种其他类型格式，也用前2位来识别，分别是8位带符号INT/16位带符号INT/32位带符号INT/LZF压缩字符串 */
+#define LEDIS_RDB_ENC_INT8 0
+#define LEDIS_RDB_ENC_INT16 1
+#define LEDIS_RDB_ENC_INT32 2
+#define LEDIS_RDB_ENC_LZF 3
 
 /*========== 客户端flags ==========*/
 #define LEDIS_CLOSE 1 //客户端是普通端，用完直接关闭
@@ -99,15 +121,22 @@
 
 //对象封装，可以是string/list/set
 typedef struct ledisObject{
-    int type;
     void *ptr;
+    int type;
     int refcount;
 } lobj;
+
+typedef struct ledisDb{
+    dict *dict;
+    dict *expires;  //额外记录了过期的key/val
+    int id;
+} ledisDb;
 
 //客户端封装
 typedef struct ledisClient{
     int fd;
-    dict *dict;
+    //dict *dict;
+    ledisDb *db;    //是指针，并不是数组
     int dictid;
     sds querybuf;
     lobj *argv[LEDIS_MAX_ARGS];
@@ -118,6 +147,7 @@ typedef struct ledisClient{
     time_t lastinteraction; //上一次交互的时间点
     int flags; //LEDIS_CLOSE或者LEDIS_SLAVE或者LEDIS_MONITOR
     int slaveseldb; //如果client是从服务端，则代表自己的dbid
+    int authenticated;  //非NULL说明需要密码
 } ledisClient;
 
 //封装save功能的参数，只有一个，所以不需要typedef
@@ -130,7 +160,10 @@ struct saveparam{
 struct ledisServer{
     int port;
     int fd;
-    dict **dict;    //内存存储的指针数组，和dbnum相关，即默认16个元素
+    //dict **dict;    //内存存储的指针数组，和dbnum相关，即默认16个元素
+    ledisDb *db;    //其实还是数组，并不是指针
+    dict *sharingpool;
+    unsigned int sharingpoolsize;
     long long dirty;    //自从上次save后经历的变更数
     list *clients;  //客户端链表
     list *slaves;   //从服务端链表
@@ -141,7 +174,7 @@ struct ledisServer{
     int cronloops;
     list *objfreelist;  //复用lobj对象的池子链表
     time_t lastsave;
-    int usedmemory; //使用的堆内存总量，单位是Mbyte
+    size_t usedmemory; //使用的堆内存总量，单位是Mbyte
     //只在stats使用
     time_t stat_starttime;  //server启动的时间
     long long stat_numcommands; //执行command的总数
@@ -162,6 +195,8 @@ struct ledisServer{
     char *logfile;
     char *bindaddr;
     char *dbfilename;
+    char *requirepass;
+    int shareobjects;
 
     /*======主从相关======*/
     int isslave;
@@ -203,35 +238,41 @@ typedef struct _ledisSortOperation{
 
 //定义会用到的lobj可复用对象
 struct sharedObjectsStruct{
-    lobj *crlf, *ok, *err, *zerobulk, *nil, *zero, *one, *pong, *space,
-    *minus1, *minus2, *minus3, *minus4,
-    *wrongtypeerr, *nokeyerr, *wrongtypeerrbulk, *nokeyerrbulk,
-    *syntaxerr, *syntaxerrbulk,
+    lobj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
+    *colon, *nullbulk, *nullmultibulk,
+    *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
+    *outofrangeerr, *plus,
     *select0, *select1, *select2, *select3, *select4,
     *select5, *select6, *select7, *select8, *select9;
 } shared;
 
 /*====================================== 函数原型 ===============================*/
 
-static lobj *createObject(int type, void *ptr);
-static lobj *createListObject(void);
-static void incrRefCount(lobj *o);
-static void decrRefCount(void *obj);
 static void freeStringObject(lobj *o);
 static void freeListObject(lobj *o);
 static void freeSetObject(lobj *o);
-static void freeHashObject(lobj *o);
-
+static void decrRefCount(void *obj);
+static lobj *createObject(int type, void *ptr);
 static void freeClient(ledisClient *c);
+static int rdbLoad(char *filename);
 static void addReply(ledisClient *c, lobj *obj);
 static void addReplySds(ledisClient *c, sds s);
-
-static int saveDbBackground(char *filename);
+static void incrRefCount(lobj *o);
+static int rdbSaveBackground(char *filename);
 static lobj *createStringObject(char *ptr, size_t len);
 static void replicationFeedSlaves(list *slaves, struct ledisCommand *cmd, int dictid, lobj **argv, int argc);
 static int syncWithMaster(void);    //和主同步
 
+static lobj *tryObjectSharing(lobj *o);
+static int removeExpire(ledisDb *db, lobj *key);
+static int expireIfNeeded(ledisDb *db, lobj *key);
+static int deleteIfVolatile(ledisDb *db, lobj *key);
+static int deleteKey(ledisDb *db, lobj *key);
+static time_t getExpire(ledisDb *db, lobj *key);
+static int setExpire(ledisDb *db, lobj *key, time_t when);
+
 //所有函数均只在本文件被调用
+static void authCommand(ledisClient *c);
 static void pingCommand(ledisClient *c);
 static void echoCommand(ledisClient *c);
 static void dbsizeCommand(ledisClient *c);
@@ -283,6 +324,7 @@ static void lremCommand(ledisClient *c);
 static void infoCommand(ledisClient *c);
 static void mgetCommand(ledisClient *c);
 static void monitorCommand(ledisClient *c);
+static void expireCommand(ledisClient *c);
 
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
@@ -324,6 +366,7 @@ static struct ledisCommand cmdTable[] = {
     {"renamenx",renamenxCommand,3,LEDIS_CMD_INLINE},
     {"keys",keysCommand,2,LEDIS_CMD_INLINE},
     {"dbsize",dbsizeCommand,1,LEDIS_CMD_INLINE},
+    {"auth",authCommand,2,LEDIS_CMD_INLINE},
     {"ping",pingCommand,1,LEDIS_CMD_INLINE},
     {"echo",echoCommand,2,LEDIS_CMD_BULK},
     {"save",saveCommand,1,LEDIS_CMD_INLINE},
@@ -337,6 +380,7 @@ static struct ledisCommand cmdTable[] = {
     {"sort",sortCommand,-2,LEDIS_CMD_INLINE},
     {"info",infoCommand,1,LEDIS_CMD_INLINE},
     {"monitor",monitorCommand,1,LEDIS_CMD_INLINE},
+    {"expire",expireCommand,3,LEDIS_CMD_INLINE},
     {NULL,NULL,0,0}
 };
 
@@ -598,33 +642,36 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     server.usedmemory = zmalloc_used_memory();
 
     int loops = server.cronloops++; //当前循环次数
-    int size, used;
     //尝试收缩每个HT
     for(int i = 0; i < server.dbnum; i++){
         //获取总量和实际使用量
-        size = dictGetHashTableSize(server.dict[i]);
-        used = dictGetHashTableUsed(server.dict[i]);
+        int size = dictSlots(server.db[i].dict);
+        int used = dictSize(server.db[i].dict);
+        int vkeys = dictSize(server.db[i].expires);
         //差不多每5秒尝试输出一下上述状态
         if(!(loops % 5) && used > 0){
-            ledisLog(LEDIS_DEBUG, "DB %d: %d keys in %d slots HT.", i, used, size);
+            ledisLog(LEDIS_DEBUG, "DB %d: %d keys (%d volatile) in %d slots HT.", i, used, vkeys, size);
+            //dictPrintStats(server.dict)
         }
         
         if(size && used && size > LEDIS_HT_MINSLOTS && 
             (used * 100 / size < LEDIS_HT_MINFILL)){
             ledisLog(LEDIS_NOTICE, "The hash table %d is too sparse, resize it...", i);
-            dictResize(server.dict[i]);
+            dictResize(server.db[i].dict);
             ledisLog(LEDIS_NOTICE, "Hash table %d resized.", i);
         }
     }    
 
-    //差不多每10秒，尝试清理超时的client
+    //每5秒输出一次状态
     if(!(loops % 5)){
-        ledisLog(LEDIS_DEBUG, "%d clients connected (%d slaves), %d bytes in use", 
+        ledisLog(LEDIS_DEBUG, "%d clients connected (%d slaves), %zu bytes in use", 
                 listLength(server.clients)-listLength(server.slaves), 
                 listLength(server.slaves),
-                server.usedmemory);
+                server.usedmemory,
+                dictSize(server.sharingpool));  //参数对应不上，最后一个没用到
     }
 
+    //差不多每10秒，尝试清理超时的client
     if(!(loops % 10)){
         closeTimedoutClients();
     }
@@ -653,8 +700,28 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
             if(server.dirty >= sp->changes && now - server.lastsave > sp->seconds){
                 ledisLog(LEDIS_NOTICE, "%d changes in %d seconds. Saving...",
                             sp->changes, sp->seconds);
-                saveDbBackground(server.dbfilename);
+                rdbSaveBackground(server.dbfilename);
                 break;
+            }
+        }
+    }
+
+    //删除有限数目的expires字典中的数据
+    for(int j = 0; j < server.dbnum; j++){
+        ledisDb *db = server.db+j;  //取当前下标的db，因为是指针写法
+        int num = dictSize(db->expires);
+        if(num){    //expires的dict有值
+            time_t now = time(NULL);
+            if(num > LEDIS_EXPIRELOOKUPS_PER_CRON){
+                num = LEDIS_EXPIRELOOKUPS_PER_CRON; //最多处理有限个
+            }
+            while(num--){
+                dictEntry *de;
+                if((de = dictGetRandomKey(db->expires)) == NULL) break; //删干净了直接退出
+                time_t t = (time_t)dictGetEntryVal(de);
+                if(now > t){    //还要判断里面的是否真过期了
+                    deleteKey(db, dictGetEntryKey(de));
+                }
             }
         }
     }
@@ -677,28 +744,25 @@ static void createSharedObjects(void){
     shared.crlf = createObject(LEDIS_STRING, sdsnew("\r\n"));
     shared.ok = createObject(LEDIS_STRING, sdsnew("+OK\r\n"));
     shared.err = createObject(LEDIS_STRING, sdsnew("-ERR\r\n"));
-    shared.zerobulk = createObject(LEDIS_STRING, sdsnew("0\r\n\r\n"));
-    shared.nil = createObject(LEDIS_STRING, sdsnew("nil\r\n"));
-    shared.zero = createObject(LEDIS_STRING, sdsnew("0\r\n"));
-    shared.one = createObject(LEDIS_STRING, sdsnew("1\r\n"));
+    shared.emptybulk = createObject(LEDIS_STRING, sdsnew("$0\r\n\r\n"));
+    shared.czero = createObject(LEDIS_STRING, sdsnew(":0\r\n"));
+    shared.cone = createObject(LEDIS_STRING, sdsnew(":1\r\n"));
+    shared.nullbulk = createObject(LEDIS_STRING, sdsnew("$-1\r\n"));
+    shared.nullmultibulk = createObject(LEDIS_STRING, sdsnew("*-1\r\n"));
+    shared.emptymultibulk = createObject(LEDIS_STRING, sdsnew("*0\r\n"));
+    
     shared.pong = createObject(LEDIS_STRING, sdsnew("+PONG\r\n"));
 
-    //找不到key
-    shared.minus1 = createObject(LEDIS_STRING, sdsnew("-1\r\n"));
-    //key的type不对
-    shared.minus2 = createObject(LEDIS_STRING, sdsnew("-2\r\n"));
-    //src和dest是一样的
-    shared.minus3 = createObject(LEDIS_STRING, sdsnew("-3\r\n"));
-    //超出范围
-    shared.minus4 = createObject(LEDIS_STRING, sdsnew("-4\r\n"));
-
     shared.wrongtypeerr = createObject(LEDIS_STRING, sdsnew("-ERR Operation against a key holding the wrong kind of value\r\n"));
-    shared.wrongtypeerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.wrongtypeerr->ptr)+2, shared.wrongtypeerr->ptr));
     shared.nokeyerr = createObject(LEDIS_STRING, sdsnew("-ERR no such key\r\n"));
-    shared.nokeyerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.nokeyerr->ptr)+2, shared.nokeyerr->ptr));
     shared.syntaxerr = createObject(LEDIS_STRING, sdsnew("-ERR syntax error\r\n"));
-    shared.syntaxerrbulk = createObject(LEDIS_STRING, sdscatprintf(sdsempty(), "%d\r\n%s", -sdslen(shared.syntaxerr->ptr)+2, shared.syntaxerr->ptr));
+    shared.sameobjecterr = createObject(LEDIS_STRING, sdsnew("-ERR source and destination objects are the same\r\n"));
+    shared.outofrangeerr = createObject(LEDIS_STRING, sdsnew("-ERR index out of range\r\n"));
+
     shared.space = createObject(LEDIS_STRING, sdsnew(" "));
+    shared.colon = createObject(LEDIS_STRING, sdsnew(":"));
+    shared.plus = createObject(LEDIS_STRING, sdsnew("+"));
+
     shared.select0 = createStringObject("select 0\r\n", 10);
     shared.select1 = createStringObject("select 1\r\n", 10);
     shared.select2 = createStringObject("select 2\r\n", 10);
@@ -746,6 +810,8 @@ static void initServerConfig(){
     server.daemonize = 0;
     server.pidfile = "/var/run/ledis.pid";
     server.dbfilename = "dump.ldb";
+    server.requirepass = NULL;
+    server.shareobjects = 0;
 
     ResetServerSaveParams();
     //给默认的配置
@@ -775,9 +841,11 @@ static void initServer(){
     server.objfreelist = listCreate();
     createSharedObjects();
     server.el = aeCreateEventLoop();
-    //初始化dict数组，只是分配了dbnum个地址空间，并没有为实际dict结构分配内存
-    server.dict = zmalloc(sizeof(dict*)*server.dbnum);
-    if(!server.dict || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist){
+    //初始化db数组，只是分配了dbnum个地址空间，并没有为实际dict结构分配内存
+    server.db = zmalloc(sizeof(ledisDb)*server.dbnum);
+    server.sharingpool = dictCreate(&setDictType, NULL);
+    server.sharingpoolsize = 1024;
+    if(!server.db || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist){
         oom("server initialization");
     }
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
@@ -788,10 +856,9 @@ static void initServer(){
     //printf("server.fd=%d\n", server.fd);
     //继续给dict数组内部真实分配
     for(int i = 0; i < server.dbnum; i++){
-        server.dict[i] = dictCreate(&hashDictType, NULL);
-        if(!server.dict[i]){
-            oom("dictCreate");
-        }
+        server.db[i].dict = dictCreate(&hashDictType, NULL);
+        server.db[i].expires = dictCreate(&setDictType, NULL);  //expires的dict只有key没有val
+        server.db[i].id = i;
     }
     server.cronloops = 0;
     server.bgsaveinprogress = 0;
@@ -809,7 +876,8 @@ static void initServer(){
  */ 
 static void emptyDb(){
     for(int i = 0; i < server.dbnum; i++){
-        dictEmpty(server.dict[i]);
+        dictEmpty(server.db[i].dict);
+        dictEmpty(server.db[i].expires);
     }
 }
 
@@ -921,6 +989,16 @@ static void loadServerConfig(char *filename){
                 err = "argument must be 'yes' or 'no'";
                 goto loaderr;
             }
+        }else if(!strcmp(argv[0], "shareobjects") && argc == 2){
+            sdstolower(argv[1]);
+            if(!strcmp(argv[1], "yes")){
+                server.shareobjects = 1;
+            }else if(!strcmp(argv[1], "no")){
+                server.shareobjects = 0;
+            }else{
+                err = "argument must be 'yes' or 'no'";
+                goto loaderr;
+            }
         }else if(!strcmp(argv[0], "daemonize") && argc == 2){
             sdstolower(argv[1]);
             if(!strcmp(argv[1], "yes")){
@@ -931,6 +1009,8 @@ static void loadServerConfig(char *filename){
                 err = "argument must be 'yes' or 'no'";
                 goto loaderr;
             }
+        }else if(!strcmp(argv[0], "requirepass") && argc == 2){
+            server.requirepass = zstrdup(argv[1]);
         }else if(!strcmp(argv[0], "pidfile") && argc == 2){
             server.pidfile = zstrdup(argv[1]);
         }else{
@@ -1055,7 +1135,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
             nwritten = objlen - c->sentlen;
         }else{
             //开始写入client，分段写入，并没有用到anet.c里面的anetWrite函数
-            nwritten = write(fd, o->ptr + c->sentlen, objlen - c->sentlen);
+            nwritten = write(fd, ((char*)o->ptr) + c->sentlen, objlen - c->sentlen);
             //printf("nwritten=%d\n", nwritten);
             if(nwritten <= 0)   break;
         }
@@ -1153,15 +1233,30 @@ static int processCommand(ledisClient *c){
             return 1;
         }
     }
+
+    //尝试利用shareobjects池子
+    if(server.shareobjects){
+        for(int i = 1; i < c->argc; i++){
+            c->argv[i] = tryObjectSharing(c->argv[i]);
+        }
+    }
+
+    //检查是否通过了auth
+    if(server.requirepass && !c->authenticated && cmd->proc != authCommand){
+        addReplySds(c, sdsnew("-ERR operation not permitted\r\n"));
+        resetClient(c);
+        return 1;
+    }
+
     //运行命令，可是inline的，也可以是bulk类型的
     long long dirty = server.dirty;
     cmd->proc(c);
     //如果配置了从，而且cmd发生了数据变动，则触发从同步
     if(server.dirty - dirty != 0 && listLength(server.slaves)){
-        replicationFeedSlaves(server.slaves, cmd, c->dictid, c->argv, c->argc);
+        replicationFeedSlaves(server.slaves, cmd, c->db->id, c->argv, c->argc);
     }
     if(listLength(server.monitors)){
-        replicationFeedSlaves(server.monitors, cmd, c->dictid, c->argv, c->argc);
+        replicationFeedSlaves(server.monitors, cmd, c->db->id, c->argv, c->argc);
     }
     server.stat_numcommands++;
 
@@ -1323,8 +1418,7 @@ static int selectDb(ledisClient *c, int id){
     if(id < 0 || id >= server.dbnum){
         return LEDIS_ERR;
     }
-    c->dict = server.dict[id];
-    c->dictid = id;
+    c->db = &server.db[id];
     return LEDIS_OK;
 }
 
@@ -1343,6 +1437,7 @@ static ledisClient *createClient(int fd){
     c->sentlen = 0;
     c->flags = 0;
     c->lastinteraction = time(NULL);
+    c->authenticated = 0;
     if((c->reply = listCreate()) == NULL)   oom("listCreate");
     listSetFreeMethod(c->reply, decrRefCount);
     //将client的fd也加入到eventLoop中（存在2种fd，监听新请求/建立起来的客户端后续请求）
@@ -1439,14 +1534,6 @@ static lobj *createListObject(void){
     return createObject(LEDIS_LIST, l);
 }
 
-#if 0
-static lobj *createHashObject(void){
-    dict *d = dictCreate(&hashDictType, NULL);
-    if(!d) oom("dictCreate");
-    return createObject(LEDIS_SET, d);
-}
-#endif
-
 /**
  * 创建一个set类型的对象，内部是个只有key的dict
  */ 
@@ -1454,34 +1541,6 @@ static lobj *createSetObject(void){
     dict *d = dictCreate(&setDictType, NULL);
     if(!d) oom("dictCreate");
     return createObject(LEDIS_SET, d);
-}
-
-/**
- * 给obj的ref引用计数加1
- */ 
-static void incrRefCount(lobj *o){
-    o->refcount++;
-}
-
-/**
- * 给obj的ref引用计数减1,如果变成0,则调用相应类型的free
- */ 
-static void decrRefCount(void *obj){
-    lobj *o = obj;
-    if(--(o->refcount) == 0){
-        switch(o->type){
-            case LEDIS_STRING : freeStringObject(o);    break;
-            case LEDIS_LIST : freeListObject(o);    break;
-            case LEDIS_SET : freeSetObject(o);    break;
-            case LEDIS_HASH : freeHashObject(o);    break;
-            default : assert(0 != 0);   break;
-        }
-        //引用为0,只是free里面的ptr数据，obj本身会加入到free列表首部，等待复用
-        if(listLength(server.objfreelist) > LEDIS_OBJFREELIST_MAX || 
-            !listAddNodeHead(server.objfreelist, o)){
-            zfree(o);
-        }
-    }
 }
 
 /**
@@ -1499,6 +1558,13 @@ static void freeListObject(lobj *o){
 }
 
 /**
+ * 释放set类型的obj
+ */ 
+static void freeSetObject(lobj *o){
+    dictRelease((dict*)o->ptr);
+}
+
+/**
  * 释放hash类型的obj
  */ 
 static void freeHashObject(lobj *o){
@@ -1506,10 +1572,111 @@ static void freeHashObject(lobj *o){
 }
 
 /**
- * 释放set类型的obj
+ * 给obj的ref引用计数加1
  */ 
-static void freeSetObject(lobj *o){
-    dictRelease((dict*)o->ptr);
+static void incrRefCount(lobj *o){
+    o->refcount++;
+#ifdef DEBUG_REFCOUNT
+    if(o->type == LEDIS_STRING){
+        printf("Increment '%s' (%p), now is: %d\n", o->ptr, o, o->refcount);
+    }
+#endif
+}
+
+/**
+ * 给obj的ref引用计数减1,如果变成0,则调用相应类型的free
+ */ 
+static void decrRefCount(void *obj){
+    lobj *o = obj;
+#ifdef DEBUG_REFCOUNT
+    if(o->type == LEDIS_STRING){
+        printf("Decrement '%s' (%p), now is: %d\n", o->ptr, o, o->refcount-1);
+    }
+#endif
+    if(--(o->refcount) == 0){
+        switch(o->type){
+            case LEDIS_STRING : freeStringObject(o);    break;
+            case LEDIS_LIST : freeListObject(o);    break;
+            case LEDIS_SET : freeSetObject(o);    break;
+            case LEDIS_HASH : freeHashObject(o);    break;
+            default : assert(0 != 0);   break;
+        }
+        //引用为0,只是free里面的ptr数据，obj本身会加入到free列表首部，等待复用
+        if(listLength(server.objfreelist) > LEDIS_OBJFREELIST_MAX || 
+            !listAddNodeHead(server.objfreelist, o)){
+            zfree(o);
+        }
+    }
+}
+
+/**
+ * 尝试使用sharedobj池子共享obj，注意只能是SDS类型的obj
+ */ 
+static lobj *tryObjectSharing(lobj *o){
+
+    unsigned long c;
+    if(o == NULL || server.shareobjects == 0) return o;
+    assert(o->type == LEDIS_STRING);
+    dictEntry *de = dictFind(server.shareobjects, o);
+    if(de){ //池子里有则复用，用里面的
+        lobj *shared = dictGetEntryKey(de);
+        //使用次数+1
+        c = ((unsigned long)dictGetEntryVal(de))+1;
+        dictGetEntryVal(de) = (void*)c;
+        incrRefCount(shared);
+        decrRefCount(o);
+        return shared;  //直接返回
+    }else{
+        if(dictSize(server.sharingpool) >= server.sharingpoolsize){  //如果用完了，则尝试
+            de = dictGetRandomKey(server.sharingpool);
+            assert(de != NULL);
+            //随机找出一个key，然后使用次数-1
+            c = ((unsigned long)dictGetEntryVal(de))-1;
+            dictGetEntryVal(de) = (void*)c;
+            if(c == 0){ //尝试delete
+                dictDelete(server.sharingpool, de->key);
+            }
+        }else{
+            c = 0;
+        }
+    }
+    if(c == 0){
+        int retval = dictAdd(server.sharingpool, o, (void*)1);
+        assert(retval == DICT_OK);
+        incrRefCount(o);
+    }
+    return o;
+}
+
+/**
+ * 便利函数，根据key的obj，直接获取val的obj
+ */ 
+static lobj *lookupKey(ledisDb *db, lobj *key){
+    dictEntry *de = dictFind(db->dict, key);
+    return de ? dictGetEntryVal(de) : NULL;
+}
+
+static lobj *lookupKeyRead(ledisDb *db, lobj *key){
+    expireIfNeeded(db, key);
+    return lookupKey(db, key);
+}
+
+static lobj *lookupKeyWrite(ledisDb *db, lobj *key){
+    deleteIfVolatile(db, key);
+    return lookupKey(db, key);
+}
+
+/**
+ * 利用dictDelete，清理db的dict和expires
+ */ 
+static int deleteKey(ledisDb *db, lobj *key){
+    //要对key进行保护，但是不明白
+    incrRefCount(key);
+    //先删除expires
+    if(dictSize(db->expires)) dictDelete(db->expires, key);
+    int retval = dictDelete(db->dict, key);
+    decrRefCount(key);
+    return retval == DICT_OK;
 }
 
 /*====================================== DB SAVE/LOAD相关 ===============================*/

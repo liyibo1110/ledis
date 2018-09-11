@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "fmacros.h"
 #include "anet.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -30,7 +31,7 @@ static void anetSetError(char *err, const char *fmt, ...){
 /**
  * 和read调用参数一样，区别是它会循环尝试读满count个字节，除非出错了或者EOF了
  */ 
-int anetRead(int fd, void *buf, int count){
+int anetRead(int fd, char *buf, int count){
     int numRead;
     int totalRead = 0;
     while(totalRead != count){
@@ -46,7 +47,7 @@ int anetRead(int fd, void *buf, int count){
 /**
  * 和write调用参数一样，区别是它会循环尝试写满count个字节，除非出错了或者EOF了
  */ 
-int anetWrite(int fd, void *buf, int count){
+int anetWrite(int fd, char *buf, int count){
     int numWritten;
     int totalWritten = 0;
     while(totalWritten != count){

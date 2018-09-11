@@ -1,3 +1,20 @@
+beta-9变化
+新的配置：
+1.增加requirepass配置，即设置连接密码，正确才能执行其它命令。
+2.增加shareobjects配置，默认是no，即之前版本的obj池子复用，原来是强制复用。
+新功能：
+1.持久化LDB文件格式发生了巨大变化，几乎是重做，还使用了lzh字符串压缩算法。
+2.增加expire过期机制，所有dict相关操作都发生了变化。
+修改BUG：无
+代码调整：
+1.Makefile的编译指令，指定c99为当前标准，还限制了必须用ANSI C的标准。
+2.封装了新头文件fmacros.h，开启了_BSD_SOURCE和_XOPEN_SOURCE特性开关，并在各个文件按需引入。
+3.anet中read和write函数，ptr参数由void*改成了更明确的char*。
+4.zmalloc里所有返回的指针，均被显式转型成char*，但函数返回类型还是void*。
+5.sds.h的sdshdr中buf初始由buf[0]改成了buf[]，sds.c的sdssplitlen函数有了一个很微小的改动。
+6.dict的获取槽数和已用节点数的宏名，改成了更简洁的dictSlots和dictSize。
+7.server和client结构中dict变成了ledisDb结构，封装了一层。
+
 beta-8变化
 新的配置：
 1.增加pidfile配置，配合daemonize配置，可以指定pid文件生成的位置。
@@ -7,12 +24,11 @@ beta-8变化
 3.增加了新的MONITOR客户端类型。
 4.增加了mget命令。
 5.去掉了version命令，换成了信息量更大的info命令。
-修改BUG：
-1.
+修改BUG：无
 代码调整：
 1.在所有程序调用malloc/free/realloc时，均替换成了zmalloc/zfree/zrealloc函数。
 2.增加了obj池子的最大数目限制（10000提高到1000000）。
-3.makefile随之更新，但里面有sha1.c和sha1.h，但实际没对应文件，并且zmalloc.c也没有引入h文件。
+3.Makefile随之更新，但里面有sha1.c和sha1.h，但实际没对应文件，并且zmalloc.c也没有引入h文件。
 
 beta-7变化
 新的配置：

@@ -245,8 +245,9 @@ sds *sdssplitlen(char *s, int len, char *sep, int seplen, int *count){
     int i;
     for(i = 0; i < (len-(seplen-1)); i++){
         if(slots < elements+2){ //数组不够了，则要动态调整
+            sds *newtokens;
             slots *= 2;
-            sds *newtokens = zrealloc(tokens, sizeof(sds)*slots);
+            newtokens = zrealloc(tokens, sizeof(sds)*slots);
             if(newtokens == NULL) {
 #ifdef SDS_ABORT_ON_OOM
                 sdsOomAbort();

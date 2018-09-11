@@ -1,3 +1,5 @@
+#include "fmacros.h"
+
 #include "dict.h"
 #include "zmalloc.h"
 #include <stdio.h>
