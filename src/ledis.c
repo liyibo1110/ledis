@@ -1681,12 +1681,148 @@ static int deleteKey(ledisDb *db, lobj *key){
 
 /*====================================== DB SAVE/LOAD相关 ===============================*/
 
-static int saveDb(char *filename){
+/**
+ * 写saveType（即存储数据的类型，占1个字节）
+ */ 
+static int ldbSaveType(FILE *fp, unsigned char type){
+    if(fwrite(&type, 1, 1, fp) == 0) return -1;
+    return 0;
+}
+
+/**
+ * 写存储的时间（占固定4个字节，没法压缩）
+ */ 
+static int ldbSaveTime(FILE *fp, time_t t){
+    //必须用定长的数据类型
+    int32_t t32 = (int32_t)t;
+    if(fwrite(&t32, 4, 1, fp) == 0) return -1;
+    return 0;
+}
+
+/**
+ * 存储数据的长度（1字节6位/2字节14位/4字节32位）
+ */ 
+static int ldbSaveLen(FILE *fp, uint32_t len){
+    unsigned char buf[2];   //存储长度类型
+    if(len < (1<<6)){   //1左移6位即1000000，即64
+        //小于64，只用6位存储即可
+        buf[0] = (len&0xFF)|(LEDIS_RDB_6BITLEN<<6); //只用1个字节即可，里面的计算其实是多余的，因为标识本身就是00
+        //只写1个字节
+        if(fwrite(buf, 1, 1, fp) == 0) return -1;
+    }else if(len < (1<<14)){    //即小于16384，只用右面14位存储，标识位为01
+        //len右移8位，相当于只留高6位，并存储在单字节的低6位空间，然后高2位追加标识位01
+        buf[0] = ((len>>8)&0xFF)|(LEDIS_RDB_14BITLEN<<6);
+        buf[1] = len&0xFF;  //len的低8位原样存储
+        //写2个字节
+        if(fwrite(buf, 2, 1, fp) == 0) return -1;
+    }else{  //大于16384，直接用32位空间存储
+        buf[0] = (LEDIS_RDB_32BITLEN<<6);   //将标识位10写入最高2位
+        //直接写1个字节，buf[0]只用了高2位，后6位都是0
+        if(fwrite(buf, 1, 1, fp) == 0) return -1;
+        len = htonl(len);   //要转网络序，有啥用，还想文件跨平台啊？
+        //直接写就完了，参数本来就是32位的
+        if(fwrite(&len, 4, 1, fp) == 0) return -1;
+    }
+    return 0;
+}
+
+/**
+ * 将s中的字符串，判断是不是纯数字（例如123或-1234）如果是，则根据位数转存到enc数组里（静态5个字节），位数不同占用空间不同
+ * 返回值为enc填充了的字节数
+ */ 
+int ldbTryIntegerEncoding(sds s, unsigned char *enc){
+    
+    char *endptr, buf[32];
+    long long value = strtoll(s, &endptr, 10);
+    if(endptr[0] != '\0') return 0; //s不是字符串
+    snprintf(buf, 32, "%lld", value);   //将带符号的数字转回字符串
+
+    if(strlen(buf) != sdslen(s) || memcmp(buf, s, sdslen(s))) return 0; //再次检查s和buf必须是同一个数值字符串
+
+    if(value >= -(1<<7) && value <= (1<<7)-1){  //value属于[-128, 127]
+        enc[0] = (LEDIS_RDB_ENCVAL<<6)|LEDIS_RDB_ENC_INT8;  //即11000000
+        enc[1] = value&0xFF;    //即实际的value
+        return 2;
+    }else if(value >= -(1<<15) && value <= (1<<15)-1){  //value属于[-32768, 32767]
+        enc[0] = (LEDIS_RDB_ENCVAL<<6)|LEDIS_RDB_ENC_INT16;  //即11000001
+        enc[1] = value&0xFF;    //先存低位了又。。
+        enc[2] = (value>>8)&0xFF;   //再存高位
+        return 3;
+    }else if(value >= -((long long)1<<31) && value <= ((long long)1<<31)-1){ 
+        enc[0] = (LEDIS_RDB_ENCVAL<<6)|LEDIS_RDB_ENC_INT32;  //即11000010
+        enc[1] = value&0xFF;
+        enc[2] = (value>>8)&0xFF;
+        enc[3] = (value>>16)&0xFF;
+        enc[4] = (value>>24)&0xFF;
+        return 5;
+    }else{
+        return 0;
+    }
+}
+
+/**
+ * 利用lzf算法压缩obj里的字符串（长度必须大于20才能进来），然后写入fp
+ */ 
+static int ldbSaveLzfStringObject(FILE *fp, lobj *obj){
+
+    void *out;
+    unsigned int outlen = sdslen(obj->ptr)-4; 
+    if(outlen <= 0) return 0;
+    if((out = zmalloc(outlen)) == NULL) return 0;
+    unsigned int comprlen = lzf_compress(obj->ptr, sdslen(obj->ptr), out, outlen);
+    if(comprlen == 0){  //压缩失败
+        zfree(out);
+        return 0;
+    }
+    //压缩成功
+    unsigned char byte = (LEDIS_RDB_ENCVAL<<6)|LEDIS_RDB_ENC_LZF;   //为11000011
+    if(fwrite(&byte, 1, 1, fp) == 0) goto writeerr;
+    if(ldbSaveLen(fp, comprlen) == -1) goto writeerr;   //压缩后的长度
+    if(ldbSaveLen(fp, sdslen(obj->ptr)) == -1) goto writeerr;   //实际的长度
+    if(fwrite(out, comprlen, 1, fp) == 0) goto writeerr;    //压缩后的实际数据
+    zfree(out);
+    return comprlen;
+writeerr:
+    zfree(out);
+    return -1;
+}
+
+/**
+ * 存储一个字符串类型的obj
+ * 返回0说明成功，-1说明有问题
+ */ 
+static int ldbSaveStringObject(FILE *fp, lobj *obj){
+
+    size_t len = sdslen(obj->ptr);
+    int enclen;
+    if(len <= 11){  //如果字符串小于等于11位，则尝试转成整数存储（但肯定不一定是）
+        unsigned char buf[5];
+        if((enclen = ldbTryIntegerEncoding(obj->ptr, buf)) > 0){
+            if(fwrite(buf, enclen, 1, fp) == 0) return -1;
+            return 0;
+        }
+    }
+
+    //不是整数，或者字符串长度过大
+    if(len > 20){   //长度大于20，才用LZF压缩算法，不然一样没效率
+        int retval = ldbSaveLzfStringObject(fp, obj);
+        if(retval == -1) return -1;
+        if(retval > 0) return 0;    //成功了
+    }
+
+    //到这里，说明即不是合理的整数，长度又不是特别大，则普通存储
+    if(ldbSaveLen(fp, len) == -1) return -1;
+    if(len && fwrite(obj->ptr, len, 1, fp) == 0) return -1;
+    return 0;
+}
+
+static int ldbSave(char *filename){
 
     dictIterator *di = NULL;
     char tmpfile[256];
+    time_t now = time(NULL);
     //建立临时文件
-    snprintf(tmpfile, 256, "temp-%d.%ld.rdb", (int)time(NULL), (long)random());
+    snprintf(tmpfile, 256, "temp-%d.%ld.ldb", (int)time(NULL), (long)random());
 
     FILE *fp = fopen(tmpfile, "w");
     if(!fp){
@@ -1694,56 +1830,55 @@ static int saveDb(char *filename){
         return LEDIS_ERR;
     }
     //写死固定的开头标识字符
-    if(fwrite("LEDIS0000", 9, 1, fp) == 0) goto werr;
+    if(fwrite("LEDIS0001", 9, 1, fp) == 0) goto werr;
     dictEntry *de;
     //需要用变量位数确定的类型，不能用int这类平台异同的类型
     uint8_t type;  
     uint32_t len;
     for(int i = 0; i < server.dbnum; i++){
-        dict *d = server.dict[i];
-        if(dictGetHashTableUsed(d) == 0) continue;
+        ledisDb *db = server.db+i;
+        dict *d = db->dict;
+        if(dictSize(d) == 0) continue;
         di = dictGetIterator(d);
         if(!di){    //为啥不goto werr
             fclose(fp);
             return LEDIS_ERR;
         }
 
-        //写当前DB的元信息，DB文件不一定在本机，所以多字节整型需要统一转大字序列
-        type = LEDIS_SELECTDB;  //只有1个字节
-        len = htonl(i); //4个字节必须要转
-        if(fwrite(&type, 1, 1, fp) == 0) goto werr;
-        if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+        //写当前DB的序号
+        if(ldbSaveType(fp, LEDIS_SELECTDB) == -1) goto werr;
+        //写序号本身，利用了整数压缩
+        if(ldbSaveLen(fp, i) == -1) goto werr;
 
         //利用迭代器，遍历当前DB的每个entry
         while((de = dictNext(di)) != NULL){
             lobj *key = dictGetEntryKey(de);
             lobj *o = dictGetEntryVal(de);
-            type = o->type;
-            len = htonl(sdslen(key->ptr));
-            //写入key信息
-            if(fwrite(&type, 1, 1, fp) == 0) goto werr; //对应val的类型
-            if(fwrite(&len, 4, 1, fp) == 0) goto werr;
-            if(fwrite(key->ptr, sdslen(key->ptr), 1, fp) == 0) goto werr;
+            time_t expiretime = getExpire(db, key);
+            
+            if(expiretime != -1){   //有expiretime则也要存储
+                //如果过期了，就不存了
+                if(expiretime < now) continue;
+                if(ldbSaveType(fp, LEDIS_EXPIRETIME) == -1) goto werr;  //写type
+                if(ldbSaveTime(fp, expiretime) == -1) goto werr;    //写实际time
+            }
+            
+            //存key和val
+            if(ldbSaveType(fp, o->type) == -1) goto werr;   //存val的type，key不用存type，因为肯定是SDS
+            if(ldbSaveStringObject(fp, key) == -1) goto werr;   //写入key
             //根据不同类型，写val信息
             if(type == LEDIS_STRING){
-                sds sval = o->ptr;
-                len = htonl(sdslen(sval));
-                if(fwrite(&len, 4, 1, fp) == 0) goto werr;
-                if(sdslen(sval) && fwrite(sval, sdslen(sval), 1, fp) == 0) goto werr;
-            }else if(type == LEDIS_LIST){
+                if(ldbSaveStringObject(fp, o) == -1) goto werr;
+            }else if(o->type == LEDIS_LIST){
                 list *list = o->ptr;
-                
                 listNode *ln = list->head;
-                len = htonl(listLength(list));  //先写list的长度
-                if(fwrite(&len, 4, 1, fp) == 0) goto werr;
+                if(ldbSaveLen(fp, listLength(list)) == -1) goto werr;
                 while(ln){
                     lobj *eleobj = listNodeValue(ln);
-                    len = htonl(sdslen(eleobj->ptr));
-                    if(fwrite(&len, 4, 1, fp) == 0) goto werr;
-                    if(sdslen(eleobj->ptr) && fwrite(eleobj->ptr, sdslen(eleobj->ptr), 1, fp) == 0) goto werr;
+                    if(ldbSaveStringObject(fp, eleobj) == -1) goto werr;
                     ln = ln->next;
                 }
-            }else if(type == LEDIS_SET){
+            }else if(o->type == LEDIS_SET){
                 dict *set = o->ptr;
                 dictIterator *di = dictGetIterator(set);
                 dictEntry *de;
