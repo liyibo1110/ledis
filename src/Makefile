@@ -1,5 +1,5 @@
 DEBUG ?= -g
-CFLAGS ?= -std=c99 -pedanitc -O2 -Wall -W -DSDS_ABORT_ON_OOM
+CFLAGS ?= -std=c99 -pedantic -O2 -Wall -W -DSDS_ABORT_ON_OOM
 CCOPT = $(CFLAGS)
 
 OBJ = adlist.o ae.o anet.o dict.o sds.o ledis.o zmalloc.o lzf_c.o lzf_d.o
@@ -20,6 +20,8 @@ dict.o: dict.c dict.h
 sds.o: sds.c sds.h
 ledis.o: ledis.c adlist.h ae.h anet.h dict.h sds.h
 zmalloc.o: zmalloc.c zmalloc.h
+lzf_c.o: lzf_c.c lzfP.h
+lzf_d.o: lzf_d.c lzfP.h
 client.o: client.c
 
 %.o: %.c

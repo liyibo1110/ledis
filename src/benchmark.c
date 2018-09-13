@@ -169,12 +169,11 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask){
                 //如果是bulk类型，说明是类似这样的5\r\nhello\r\n，需要分别取长度和信息本身
                 *p = '\0';
                 *(p-1) = '\0';  //将reply字符串中的\r\n去掉
-                if(memcmp(c->ibuf, "nil", 3) == 0){
+                c->readlen = atoi(c->ibuf+1)+2; //加1是为了跳过返回信息的特殊标识符号
+                if(c->readlen == -1){
                     clientDone(c);
                     return;
                 }
-                //如果返回不是nil，则尝试读取bulk字符串
-                c->readlen = atoi(c->ibuf)+2;
                 c->ibuf = sdsrange(c->ibuf, (p-c->ibuf)+1, -1);
                 //这里不return
             }else{  //普通类型，类似这样hello\r\n
