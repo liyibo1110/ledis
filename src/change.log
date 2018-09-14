@@ -1,10 +1,34 @@
+0.96变化
+修改BUG：
+1.ledis中readQueryFromClient函数存在超过16个参数则跳过free的情况，这属于严重BUG。
+
+0.95变化
+修改BUG：
+1.ledis中ldbLoadLzfStringObject函数忘了zfree了，这属于严重BUG。
+
+0.94变化
+代码调整：
+1.ledis中对dict桶数和节点数的变量类型由int改成了long long（但是dict里面本身结构却没改）
+
+0.93变化
+修改BUG：
+1.ledis中ldbSaveLzfStringObject函数，为压缩后缓冲区多分配1个字节（应该是存\0），这并不会每次都有问题。
+
+0.92变化
+修改BUG：
+1.dict中dictGetRandomKey函数，已用节点数为0则直接返回NULL，而不是桶数为空，桶数永远不为空，这属于严重BUG。
+
+0.91变化
+代码调整：
+1.sinterGenericCommand函数，允许其中参数key找不到，如果是sinterstore则会返回ok，否则返回*-1而不是nokeyerr的错误字符串。
+
 beta-9变化
 新的配置：
 1.增加requirepass配置，即设置连接密码，正确才能执行其它命令。
 2.增加shareobjects配置，默认是no，即之前版本的obj池子复用，原来是强制复用。
 新功能：
 1.持久化LDB文件格式发生了巨大变化，几乎是重做，还使用了lzh字符串压缩算法。
-2.增加expire过期机制，所有dict相关操作都发生了变化。
+2.增加expire过期机制，所有dict相关操作都发生了变化（像是半成品，expire需要用专门的command来设置，而且很多command都会直接干掉设置了的key）
 修改BUG：无
 代码调整：
 1.Makefile的编译指令，指定c99为当前标准，还限制了必须用ANSI C的标准。
@@ -14,6 +38,8 @@ beta-9变化
 5.sds.h的sdshdr中buf初始由buf[0]改成了buf[]，sds.c的sdssplitlen函数有了一个很微小的改动。
 6.dict的获取槽数和已用节点数的宏名，改成了更简洁的dictSlots和dictSize。
 7.server和client结构中dict变成了ledisDb结构，封装了一层。
+8.增加了对key实际值访问的函数（同时也处理expire的情况），因此几乎所有command都发生了调整。
+9.shared静态字符串对象有了很大变动。
 
 beta-8变化
 新的配置：

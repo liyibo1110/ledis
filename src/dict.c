@@ -269,7 +269,7 @@ void dictReleaseIterator(dictIterator *iter){
 }
 
 dictEntry *dictGetRandomKey(dict *ht){
-    if(ht->size == 0) return NULL;
+    if(ht->used == 0) return NULL;
     unsigned int h;
     dictEntry *he;
     do{

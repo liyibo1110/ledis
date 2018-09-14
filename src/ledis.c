@@ -31,7 +31,7 @@
 #include "zmalloc.h"
 #include "lzf.h"
 
-#define LEDIS_VERSION "0.09"
+#define LEDIS_VERSION "0.096"
 
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
@@ -145,7 +145,7 @@ typedef struct ledisClient{
     time_t lastinteraction; //上一次交互的时间点
     int flags; //LEDIS_CLOSE或者LEDIS_SLAVE或者LEDIS_MONITOR
     int slaveseldb; //如果client是从服务端，则代表自己的dbid
-    int authenticated;  //非NULL说明需要密码
+    int authenticated;  //是否已验证
 } ledisClient;
 
 //封装save功能的参数，只有一个，所以不需要typedef
@@ -643,9 +643,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     //尝试收缩每个HT
     for(int i = 0; i < server.dbnum; i++){
         //获取总量和实际使用量
-        int size = dictSlots(server.db[i].dict);
-        int used = dictSize(server.db[i].dict);
-        int vkeys = dictSize(server.db[i].expires);
+        long long size = dictSlots(server.db[i].dict);
+        long long used = dictSize(server.db[i].dict);
+        long long vkeys = dictSize(server.db[i].expires);
         //差不多每5秒尝试输出一下上述状态
         if(!(loops % 5) && used > 0){
             ledisLog(LEDIS_DEBUG, "DB %d: %d keys (%d volatile) in %d slots HT.", i, used, vkeys, size);
@@ -674,7 +674,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
         closeTimedoutClients();
     }
 
-    //尝试bgsave，暂不实现
+    //尝试bgsave
     if(server.bgsaveinprogress){
         //如果正在bgsave，则阻塞
         int statloc;
@@ -724,7 +724,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
         }
     }
 
-    //如果是从服务端，还要检查与主的同步
+    //如果是从服务端，还要检查与主的同步，只会运行1次，同步成功以后状态会变成CONNECTED
     if(server.replstate == LEDIS_REPL_CONNECT){
         ledisLog(LEDIS_NOTICE, "Connecting to MASTER...");
         if(syncWithMaster() == LEDIS_OK){
@@ -1381,7 +1381,7 @@ again:
             sdsfree(query); //再见了，c->querybuf已经指向新的结构了
             if(argv == NULL)    oom("sdssplitlen");
             for(int i = 0; i < argc && i < LEDIS_MAX_ARGS; i++){
-                if(sdslen(argv[i])){
+                if(i < LEDIS_MAX_ARGS && sdslen(argv[i])){
                     //终于把命令弄进去了
                     c->argv[c->argc] = createObject(LEDIS_STRING, argv[i]);
                     c->argc++;
@@ -1766,7 +1766,7 @@ static int ldbSaveLzfStringObject(FILE *fp, lobj *obj){
     void *out;
     unsigned int outlen = sdslen(obj->ptr)-4; 
     if(outlen <= 0) return 0;
-    if((out = zmalloc(outlen)) == NULL) return 0;
+    if((out = zmalloc(outlen+1)) == NULL) return 0;
     unsigned int comprlen = lzf_compress(obj->ptr, sdslen(obj->ptr), out, outlen);
     if(comprlen == 0){  //压缩失败
         zfree(out);
@@ -2018,6 +2018,7 @@ static lobj *ldbLoadLzfStringObject(FILE *fp, int ldbver){
     if((val = sdsnewlen(NULL, len)) == NULL) goto err;  //存解压缩后字符串
     if(fread(c, clen, 1, fp) == 0) goto err;
     if(lzf_decompress(c, clen, val, len) == 0) goto err;
+    zfree(c);
     return createObject(LEDIS_STRING, val);
 
 err:
@@ -2921,7 +2922,12 @@ static void sinterGenericCommand(ledisClient *c, lobj **setskeys, int setsnum, l
                                 lookupKeyRead(c->db, setskeys[i]);
         if(setobj == NULL){ //每个key参数必须要有效
             zfree(dv);
-            addReply(c, shared.nokeyerr);
+            if(dstkey){
+                deleteKey(c->db, dstkey);
+                addReply(c, shared.ok);
+            }else{
+                addReply(c, shared.nullmultibulk);
+            }
             return;
         }
         if(setobj->type != LEDIS_SET){
