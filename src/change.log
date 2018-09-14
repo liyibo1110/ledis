@@ -1,3 +1,20 @@
+0.1变化
+新的配置：
+1.修改配置timeout，如果是0则无时间限制。
+2.增加dbfilename配置。
+3.增加maxclients最大连接数配置。
+新功能：
+1.增加了新的命令smove/sunion/sunionstore/sdiff/sdiffstore/getSet/ttl/slaveof
+2.所有的log输出，增加了当前时间前缀。
+修改BUG：无
+代码调整：
+1.list结构增加了内部的迭代器，同时增加了配置rewind/rewindTail/yield操作函数。
+2.anet的backlog参数由32提高到64。
+3.规范了dict的参数（unsigned int改成了unsigned long），也新引用了limits.h的极值常量。
+4.ledis中客户端参数argv容器，由16个固定长度，改成了动态长度，初始值为4个。
+5.del命令支持传多个key了，而不是原来的1个。
+6.emptyDb函数，会返回清空前所有库节点的总数。
+
 0.96变化
 修改BUG：
 1.ledis中readQueryFromClient函数存在超过16个参数则跳过free的情况，这属于严重BUG。

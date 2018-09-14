@@ -8,6 +8,7 @@ static size_t used_memory = 0;
 void *zmalloc(size_t size){
     //多申请一段size_t长度的空间
     void *ptr = malloc(size+sizeof(size_t));
+    if(!ptr) return NULL;
     //在空间size_t的长度里，先写入size的实际大小
     *((size_t*)ptr) = size;
     used_memory += size+sizeof(size_t); //记录增加的大小

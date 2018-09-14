@@ -24,9 +24,9 @@ typedef struct dictType{
 typedef struct dict{
     dictEntry **table;
     dictType *type;
-    unsigned int size;  //hash桶数
-    unsigned int sizemask;  //桶数-1
-    unsigned int used;  //共节点数
+    unsigned long size;  //hash桶数
+    unsigned long sizemask;  //桶数-1
+    unsigned long used;  //共节点数
     void *privdata;
 } dict;
 
@@ -76,7 +76,7 @@ typedef struct dictIterator{
 
 /*--------------------函数定义----------------------*/
 dict *dictCreate(dictType *type, void *privDataPtr);    //初始化
-int dictExpand(dict *ht, unsigned int size);    //扩展桶数
+int dictExpand(dict *ht, unsigned long size);    //扩展桶数
 int dictAdd(dict *ht, void *key, void *val);    //增加键值对
 int dictReplace(dict *ht, void *key, void *val);    //修改键值对
 int dictDelete(dict *ht, void *key);    //删除键

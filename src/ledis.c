@@ -30,15 +30,16 @@
 #include "adlist.h"
 #include "zmalloc.h"
 #include "lzf.h"
+#include "pqsort.h"
 
-#define LEDIS_VERSION "0.096"
+#define LEDIS_VERSION "0.100"
 
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
 #define LEDIS_MAXIDLETIME   (60*5)  //默认客户端timeout时长
-#define LEDIS_QUERYBUF_LEN  1024    //1k
+#define LEDIS_IOBUF_LEN  1024    //1k
 #define LEDIS_LOADBUF_LEN   1024    //1k
-#define LEDIS_MAX_ARGS  16
+#define LEDIS_STATIC_ARGS  4
 #define LEDIS_DEFAULT_DBNUM 16  //默认db数目
 #define LEDIS_CONFIGLINE_MAX    1024    //1k
 #define LEDIS_OBJFREELIST_MAX 1000000 //obj池子最大数目
@@ -94,6 +95,12 @@
 #define LEDIS_REPL_CONNECT 1 //必须要连主
 #define LEDIS_REPL_CONNECTED 2 //已连上主
 
+//主从复制中，主的状态
+#define LEDIS_REPL_WAIT_BGSAVE_START 3  //主在等bgsave开始运行
+#define LEDIS_REPL_WAIT_BGSAVE_END 4    //主在等bgsave运行完毕
+#define LEDIS_REPL_SEND_BULK 5  //主在发送bulk信息
+#define LEDIS_REPL_ONLINE 6 //有待完善
+
 /*========== list相关 ==========*/
 #define LEDIS_HEAD  0   //链表遍历方向
 #define LEDIS_TAIL  1
@@ -137,7 +144,7 @@ typedef struct ledisClient{
     ledisDb *db;    //是指针，并不是数组
     int dictid;
     sds querybuf;
-    lobj *argv[LEDIS_MAX_ARGS];
+    lobj **argv;    //不再是固定16个，而是动态了
     int argc;
     int bulklen;
     list *reply;
@@ -146,6 +153,10 @@ typedef struct ledisClient{
     int flags; //LEDIS_CLOSE或者LEDIS_SLAVE或者LEDIS_MONITOR
     int slaveseldb; //如果client是从服务端，则代表自己的dbid
     int authenticated;  //是否已验证
+    int replstate;  //如果是从，用作存放主从的状态
+    int repldbfd;   //主从复制中，db文件的fd
+    long repldboff; //db文件的偏移量
+    off_t repldbsize;   //db文件总大小
 } ledisClient;
 
 //封装save功能的参数，只有一个，所以不需要typedef
@@ -203,6 +214,8 @@ struct ledisServer{
     ledisClient *master;
     int replstate;
     
+    unsigned int maxclients;
+
     /*======排序相关======*/
     int sort_desc;
     int sort_alpha;
@@ -268,6 +281,8 @@ static int deleteIfVolatile(ledisDb *db, lobj *key);
 static int deleteKey(ledisDb *db, lobj *key);
 static time_t getExpire(ledisDb *db, lobj *key);
 static int setExpire(ledisDb *db, lobj *key, time_t when);
+static void updateSalvesWaitingBgsave(int bgsaveerr);   //貌似单词拼错了
+
 
 //所有函数均只在本文件被调用
 static void authCommand(ledisClient *c);
@@ -309,10 +324,15 @@ static void ltrimCommand(ledisClient *c);
 static void typeCommand(ledisClient *c);
 static void saddCommand(ledisClient *c);
 static void sremCommand(ledisClient *c);
+static void smoveCommand(ledisClient *c);
 static void sismemberCommand(ledisClient *c);
 static void scardCommand(ledisClient *c);
 static void sinterCommand(ledisClient *c);
 static void sinterstoreCommand(ledisClient *c);
+static void sunionCommand(ledisClient *c);
+static void sunionstoreCommand(ledisClient *c);
+static void sdiffCommand(ledisClient *c);
+static void sdiffstoreCommand(ledisClient *c);
 
 static void syncCommand(ledisClient *c);
 static void flushdbCommand(ledisClient *c);
@@ -324,13 +344,17 @@ static void mgetCommand(ledisClient *c);
 static void monitorCommand(ledisClient *c);
 static void expireCommand(ledisClient *c);
 
+static void getSetCommand(ledisClient *c);
+static void ttlCommand(ledisClient *c);
+static void slaveofCommand(ledisClient *c);
+
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
     {"set",setCommand,3,LEDIS_CMD_BULK},
     {"setnx",setnxCommand,3,LEDIS_CMD_BULK},
     {"get",getCommand,2,LEDIS_CMD_INLINE},
-    {"del",delCommand,2,LEDIS_CMD_INLINE},
+    {"del",delCommand,-2,LEDIS_CMD_INLINE},
     {"exists",existsCommand,2,LEDIS_CMD_INLINE},
     {"incr",incrCommand,2,LEDIS_CMD_INLINE},
     {"decr",decrCommand,2,LEDIS_CMD_INLINE},
@@ -348,20 +372,27 @@ static struct ledisCommand cmdTable[] = {
 
     {"sadd",saddCommand,3,LEDIS_CMD_BULK},
     {"srem",sremCommand,3,LEDIS_CMD_BULK},
+    {"smove",smoveCommand,4,LEDIS_CMD_BULK},
     {"sismember",sismemberCommand,3,LEDIS_CMD_BULK},
     {"scard",scardCommand,2,LEDIS_CMD_INLINE},
     {"sinter",sinterCommand,-2,LEDIS_CMD_INLINE},
     {"sinterstore",sinterstoreCommand,-3,LEDIS_CMD_INLINE},
+    {"sunion",sunionCommand,-2,LEDIS_CMD_INLINE},
+    {"sunionstore",sunionstoreCommand,-3,LEDIS_CMD_INLINE},
+    {"sdiff",sdiffCommand,-2,LEDIS_CMD_INLINE},
+    {"sdiffstore",sdiffstoreCommand,-3,LEDIS_CMD_INLINE},
     {"smembers",sinterCommand,2,LEDIS_CMD_INLINE},
 
     {"incrby",incrbyCommand,2,LEDIS_CMD_INLINE},
     {"decrby",decrbyCommand,2,LEDIS_CMD_INLINE},
+    {"getset",getSetCommand,3,LEDIS_CMD_BULK},
 
     {"randomkey",randomKeyCommand,1,LEDIS_CMD_INLINE},
     {"select",selectCommand,2,LEDIS_CMD_INLINE},
     {"move",moveCommand,3,LEDIS_CMD_INLINE},
     {"rename",renameCommand,3,LEDIS_CMD_INLINE},
     {"renamenx",renamenxCommand,3,LEDIS_CMD_INLINE},
+    {"expire",expireCommand,3,LEDIS_CMD_INLINE},
     {"keys",keysCommand,2,LEDIS_CMD_INLINE},
     {"dbsize",dbsizeCommand,1,LEDIS_CMD_INLINE},
     {"auth",authCommand,2,LEDIS_CMD_INLINE},
@@ -378,7 +409,8 @@ static struct ledisCommand cmdTable[] = {
     {"sort",sortCommand,-2,LEDIS_CMD_INLINE},
     {"info",infoCommand,1,LEDIS_CMD_INLINE},
     {"monitor",monitorCommand,1,LEDIS_CMD_INLINE},
-    {"expire",expireCommand,3,LEDIS_CMD_INLINE},
+    {"ttl",ttlCommand,2,LEDIS_CMD_INLINE},
+    {"slaveof",slaveofCommand,3,LEDIS_CMD_INLINE},
     {NULL,NULL,0,0}
 };
 
@@ -532,7 +564,11 @@ void ledisLog(int level, const char *fmt, ...){
     //尝试输出log
     if(level >= server.verbosity){
         char *c = ".-*";    //3个级别的前缀符号
-        fprintf(fp, "%c", c[level]);
+        char buf[64];
+        time_t now = time(NULL);
+        strftime(buf, 64, "%d %b %H:%M:%S", gmtime(&now));  //特定格式化
+
+        fprintf(fp, "%s %c", buf, c[level]);
         vfprintf(fp, fmt, ap);
         fprintf(fp, "\n");
         fflush(fp);
@@ -610,20 +646,38 @@ dictType setDictType = {
  */ 
 void closeTimedoutClients(void){
     time_t now = time(NULL);
-    listIter *li = listGetIterator(server.clients, AL_START_HEAD);
-    if(!li) return;
     listNode *ln;
     ledisClient *c;
-    while((ln = listNextElement(li)) != NULL){
+    listRewind(server.clients);
+    while((ln = listYield(server.clients)) != NULL){
         c = listNodeValue(ln);
-        //检查上次交互的时间，slave客户端没有timeout
-        if(!(c->flags & LEDIS_SLAVE) && now - c->lastinteraction > server.maxidletime){
+        //检查上次交互的时间，slave客户端以及master端都没有timeout
+        if(!(c->flags & LEDIS_SLAVE) && 
+            !(c->flags & LEDIS_MASTER) && 
+            now - c->lastinteraction > server.maxidletime){
             ledisLog(LEDIS_DEBUG, "Closing idle client");
             //关闭client
             freeClient(c);
         }
     }
-    listReleaseIterator(li);
+}
+
+/**
+ * 尝试resize，给单独提取成函数了
+ */ 
+void tryResizeHashTables(void){
+    //尝试收缩每个HT
+    for(int i = 0; i < server.dbnum; i++){
+        //获取总量和实际使用量
+        long long size = dictSlots(server.db[i].dict);
+        long long used = dictSize(server.db[i].dict);
+        if(size && used && size > LEDIS_HT_MINSLOTS && 
+            (used * 100 / size < LEDIS_HT_MINFILL)){
+            ledisLog(LEDIS_NOTICE, "The hash table %d is too sparse, resize it...", i);
+            dictResize(server.db[i].dict);
+            ledisLog(LEDIS_NOTICE, "Hash table %d resized.", i);
+        }
+    }
 }
 
 /**
@@ -651,14 +705,11 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
             ledisLog(LEDIS_DEBUG, "DB %d: %d keys (%d volatile) in %d slots HT.", i, used, vkeys, size);
             //dictPrintStats(server.dict)
         }
-        
-        if(size && used && size > LEDIS_HT_MINSLOTS && 
-            (used * 100 / size < LEDIS_HT_MINFILL)){
-            ledisLog(LEDIS_NOTICE, "The hash table %d is too sparse, resize it...", i);
-            dictResize(server.db[i].dict);
-            ledisLog(LEDIS_NOTICE, "Hash table %d resized.", i);
-        }
     }    
+
+    //在bgsave中resize也可以，但是fork的子进程是有copy-on-write特性的
+    //因此在子进程save过程中，主进程如果改变了数据结构，会影响子进程效率
+    if(!server.bgsaveinprogress) tryResizeHashTables();
 
     //每5秒输出一次状态
     if(!(loops % 5)){
@@ -670,7 +721,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     }
 
     //差不多每10秒，尝试清理超时的client
-    if(!(loops % 10)){
+    if(server.maxidletime && !(loops % 10)){
         closeTimedoutClients();
     }
 
@@ -689,6 +740,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
                 ledisLog(LEDIS_WARNING, "Background saving error");
             }
             server.bgsaveinprogress = 0;    //只有在这里还原标记
+            //通知所有等待bgsave的从们
+            updateSalvesWaitingBgsave(exitcode == 0 ? LEDIS_OK : LEDIS_ERR);
         }
     }else{
         //检测是否需要bgsave
@@ -810,6 +863,7 @@ static void initServerConfig(){
     server.dbfilename = "dump.ldb";
     server.requirepass = NULL;
     server.shareobjects = 0;
+    server.maxclients = 0;
 
     ResetServerSaveParams();
     //给默认的配置
@@ -873,9 +927,27 @@ static void initServer(){
  * 清空server的所有dict
  */ 
 static void emptyDb(){
+
+    long long removed = 0;
     for(int i = 0; i < server.dbnum; i++){
+        removed += dictSize(server.db[i].dict);
         dictEmpty(server.db[i].dict);
         dictEmpty(server.db[i].expires);
+    }
+    return removed;
+}
+
+/**
+ * 工具函数，将配置文件里的yes和no转化为数字
+ * 既不是yes或no，返回-1
+ */ 
+static int yesnotoi(char *s){
+    if(!strcasecmp(s, "yes")){
+        return 1;
+    }else if(!strcasecmp(s, "no")){
+        return 0;
+    }else{
+        return -1;
     }
 }
 
@@ -911,21 +983,21 @@ static void loadServerConfig(char *filename){
         sdstolower(argv[0]);
 
         //开始实施这一行的配置
-        if(!strcmp(argv[0], "timeout") && argc == 2){
+        if(!strcasecmp(argv[0], "timeout") && argc == 2){
             server.maxidletime = atoi(argv[1]);
-            if(server.maxidletime < 1){
+            if(server.maxidletime < 0){
                 err = "Invalid timeout value";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "port") && argc == 2){
+        }else if(!strcasecmp(argv[0], "port") && argc == 2){
             server.port = atoi(argv[1]);
             if(server.port < 1 || server.port > 65535){
                 err = "Invalid port";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "bindaddr") && argc == 2){
+        }else if(!strcasecmp(argv[0], "bind") && argc == 2){
             server.bindaddr = zstrdup(argv[1]);
-        }else if(!strcmp(argv[0], "save") && argc == 3){
+        }else if(!strcasecmp(argv[0], "save") && argc == 3){
             int seconds = atoi(argv[1]);
             int changes = atoi(argv[2]);
             if(seconds < 1 || changes < 0){
@@ -933,25 +1005,25 @@ static void loadServerConfig(char *filename){
                 goto loaderr;
             }
             appendServerSaveParams(seconds, changes);
-        }else if(!strcmp(argv[0], "dir") && argc == 2){
+        }else if(!strcasecmp(argv[0], "dir") && argc == 2){
             if(chdir(argv[1]) == -1){
                 ledisLog(LEDIS_WARNING, "Can't chdir to '%s': %s", argv[1], strerror(errno));
                 exit(EXIT_FAILURE);
             }
-        }else if(!strcmp(argv[0], "loglevel") && argc == 2){
-            if(!strcmp(argv[1], "debug")){
+        }else if(!strcasecmp(argv[0], "loglevel") && argc == 2){
+            if(!strcasecmp(argv[1], "debug")){
                 server.verbosity = LEDIS_DEBUG;
-            }else if(!strcmp(argv[1], "notice")){
+            }else if(!strcasecmp(argv[1], "notice")){
                 server.verbosity = LEDIS_NOTICE;
-            }else if(!strcmp(argv[1], "warning")){
+            }else if(!strcasecmp(argv[1], "warning")){
                 server.verbosity = LEDIS_WARNING;
             }else{
                 err = "Invalid log level. Must be one of debug, notice, warning";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "logfile") && argc == 2){
+        }else if(!strcasecmp(argv[0], "logfile") && argc == 2){
             server.logfile = zstrdup(argv[1]);   //需要复制字符串，因为argv是函数范围
-            if(!strcmp(server.logfile, "stdout")){
+            if(!strcasecmp(server.logfile, "stdout")){
                 zfree(server.logfile);
                 server.logfile = NULL;
             }
@@ -966,51 +1038,41 @@ static void loadServerConfig(char *filename){
                 }
                 fclose(fp);
             }
-        }else if(!strcmp(argv[0], "databases") && argc ==2){
+        }else if(!strcasecmp(argv[0], "databases") && argc == 2){
             //dbnum的值在这里可能变了，但是dict数组已经在之前已经分配16组空间了，疑似BUG
+            //loadConfig操作已在initServer之前执行，所以上面提到的BUG解除
             server.dbnum = atoi(argv[1]);
             if(server.dbnum < 1){
                 err = "Invalid number of databases";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "slaveof") && argc ==3){
+        }else if(!strcasecmp(argv[0], "maxclients") && argv == 2){
+            server.maxclients = atoi(argv[1]);
+        }else if(!strcasecmp(argv[0], "slaveof") && argc ==3){
             server.masterhost = sdsnew(argv[1]);
             server.masterport = atoi(argv[2]);
             server.replstate = LEDIS_REPL_CONNECT;  //说明是从
-        }else if(!strcmp(argv[0], "glueoutputbuf") && argc == 2){
-            sdstolower(argv[1]);
-            if(!strcmp(argv[1], "yes")){
-                server.glueoutputbuf = 1;
-            }else if(!strcmp(argv[1], "no")){
-                server.glueoutputbuf = 0;
-            }else{
+        }else if(!strcasecmp(argv[0], "glueoutputbuf") && argc == 2){
+            if((server.glueoutputbuf = yesnotoi(argv[1])) == -1){
                 err = "argument must be 'yes' or 'no'";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "shareobjects") && argc == 2){
-            sdstolower(argv[1]);
-            if(!strcmp(argv[1], "yes")){
-                server.shareobjects = 1;
-            }else if(!strcmp(argv[1], "no")){
-                server.shareobjects = 0;
-            }else{
+        }else if(!strcasecmp(argv[0], "shareobjects") && argc == 2){
+            if((server.shareobjects = yesnotoi(argv[1])) == -1){
                 err = "argument must be 'yes' or 'no'";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "daemonize") && argc == 2){
-            sdstolower(argv[1]);
-            if(!strcmp(argv[1], "yes")){
-                server.daemonize = 1;
-            }else if(!strcmp(argv[1], "no")){
-                server.daemonize = 0;
-            }else{
+        }else if(!strcasecmp(argv[0], "daemonize") && argc == 2){
+            if((server.daemonize = yesnotoi(argv[1])) == -1){
                 err = "argument must be 'yes' or 'no'";
                 goto loaderr;
             }
-        }else if(!strcmp(argv[0], "requirepass") && argc == 2){
+        }else if(!strcasecmp(argv[0], "requirepass") && argc == 2){
             server.requirepass = zstrdup(argv[1]);
-        }else if(!strcmp(argv[0], "pidfile") && argc == 2){
+        }else if(!strcasecmp(argv[0], "pidfile") && argc == 2){
             server.pidfile = zstrdup(argv[1]);
+        }else if(!strcasecmp(argv[0], "dbfilename") && argc == 2){
+            server.dbfilename = zstrdup(argv[1]);
         }else{
             err = "Bad directive or wrong number of arguments";
             goto loaderr;

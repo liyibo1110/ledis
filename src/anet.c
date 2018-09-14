@@ -224,7 +224,7 @@ int anetTcpServer(char *err, int port, char *bindaddr){
     }
 
     //最后开始监听
-    if(listen(sfd, 32) == -1){
+    if(listen(sfd, 64) == -1){
         anetSetError(err, "listen: %s\n", strerror(errno));
         close(sfd);
         return ANET_ERR;

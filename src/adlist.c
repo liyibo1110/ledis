@@ -96,7 +96,27 @@ listIter *listGetIterator(list *list, int direction){
     return iter;    //返回的iter是需要自己在外面释放的
 }
 
-listNode *listNextElement(listIter *iter){
+void listReleaseIterator(listIter *iter){
+    zfree(iter); //释放自己就够了，不需要释放node
+}
+
+/**
+ * 在list里初始化一个可用的正向单向迭代器
+ */ 
+void listRewind(list *list){
+    list->iter.next = list->head;
+    list->iter.direction = AL_START_HEAD;
+}
+
+/**
+ * 在list里初始化一个可用的反向单向迭代器
+ */ 
+void listRewindTail(list *list){
+    list->iter.next = list->tail;
+    list->iter.direction = AL_START_TAIL;
+}
+
+listNode *listNext(listIter *iter){
     listNode *current = iter->next;
     if(current != NULL){    //有元素则需要移动迭代器，指向下一个元素
         if(iter->direction == AL_START_HEAD){
@@ -108,9 +128,13 @@ listNode *listNextElement(listIter *iter){
     return current;
 }
 
-void listReleaseIterator(listIter *iter){
-    zfree(iter); //释放自己就够了，不需要释放node
+/**
+ * 调用内部的迭代器，访问下一个元素
+ */ 
+listNode *listYield(list *list){
+    return listNext(&list->iter);
 }
+
 
 list *listDup(list *orig){
     list *copy = listCreate();
@@ -122,7 +146,7 @@ list *listDup(list *orig){
     listIter *iter = listGetIterator(orig, AL_START_HEAD);
 
     listNode *node;
-    while((node = listNextElement(iter)) != NULL){
+    while((node = listNext(iter)) != NULL){
         void *value;
         if(copy->dup){  //如果有自定义的dup函数
             value = copy->dup(node->value);
@@ -148,7 +172,7 @@ list *listDup(list *orig){
 listNode *listSearchKey(list *list, void *key){
     listIter *iter = listGetIterator(list, AL_START_HEAD);
     listNode *node;
-    while((node = listNextElement(iter)) != NULL){
+    while((node = listNext(iter)) != NULL){
         if(list->match){    //如果有自定义的match函数
             if(list->match(node->value, key)){
                 listReleaseIterator(iter);

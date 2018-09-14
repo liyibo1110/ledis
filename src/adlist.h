@@ -7,6 +7,12 @@ typedef struct listNode{
     void *value;
 } listNode;
 
+typedef struct listIter{
+    listNode *next;
+    listNode *prev;
+    int direction;
+} listIter;
+
 typedef struct list{
     listNode *head;
     listNode *tail;
@@ -14,13 +20,10 @@ typedef struct list{
     void (*free)(void *ptr);    //释放函数实现
     int (*match)(void *ptr, void *key); //比较函数实现
     unsigned int len;
+    listIter iter;  //不是指针，所以不用分配内存初始化
 } list;
 
-typedef struct listIter{
-    listNode *next;
-    listNode *prev;
-    int direction;
-} listIter;
+
 
 /* 定义了相关的操作宏 */
 #define listLength(l) ((l)->len)    //返回链表长度
@@ -45,11 +48,15 @@ list *listAddNodeHead(list *list, void *value); //头部插入
 list *listAddNodeTail(list *list, void *value); //尾部插入
 void listDelNode(list *list, listNode *node);   //删除特定节点
 listIter *listGetIterator(list *list, int direction);   //获取指定方向的迭代器
-listNode *listNextElement(listIter *iter);  //从迭代器返回当前元素
+listNode *listNext(listIter *iter);  //从迭代器返回当前元素
 void listReleaseIterator(listIter *iter);   //释放迭代器
 list *listDup(list *orig);  //复制链表
 listNode *listSearchKey(list *list, void *key); //寻找特定值的节点
 listNode *listIndex(list *list, int index); //根据下标返回节点
+
+void listRewind(list *list);
+void listRewindTail(list *list);
+listNode *listYield(list *list);
 
 /* 定义迭代器方向变量 */
 #define AL_START_HEAD 0

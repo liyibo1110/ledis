@@ -1,12 +1,14 @@
 #include "fmacros.h"
 
-#include "dict.h"
-#include "zmalloc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <assert.h>
+#include <limits.h>
+
+#include "dict.h"
+#include "zmalloc.h"
 
 /*------------------------工具函数-----------------------*/
 /**
@@ -22,7 +24,7 @@ static void _dictPanic(const char *fmt, ...){
 }
 
 /*------------------------内存函数-----------------------*/
-static void *_dictAlloc(int size){  //为什么不是size_t？
+static void *_dictAlloc(size_t size){  
     void *p = zmalloc(size);
     if(p == NULL){
         _dictPanic("Out of memory");
@@ -36,7 +38,7 @@ static void _dictFree(void *ptr){
 
 /*-----------------------私有函数原型--------------------*/
 static int _dictExpandIfNeeded(dict *ht);
-static unsigned int _dictNextPower(unsigned int size);
+static unsigned long _dictNextPower(unsigned long size);
 static int _dictKeyIndex(dict *ht, const void *key);    //返回桶索引
 static int _dictInit(dict *ht, dictType *type, void *privDataPtr);
 
@@ -107,8 +109,8 @@ int dictResize(dict *ht){
 /**
  * 可用来调整，也可用来新增
  */ 
-int dictExpand(dict *ht, unsigned int size){
-    unsigned int realsize = _dictNextPower(size);
+int dictExpand(dict *ht, unsigned long size){
+    unsigned long realsize = _dictNextPower(size);
     if(ht->used > size) return DICT_ERR;
     dict n; //是实体不是指针，所以已经有了局部范围的内存空间
     _dictInit(&n, ht->type, ht->privdata);
@@ -202,7 +204,7 @@ int dictDeleteNoFree(dict *ht, void *key){
  * 清理ht里面的所有数据，但不是删除ht本身
  */ 
 int _dictClear(dict *ht){
-    for(unsigned int i = 0; i > ht->size && ht->used > 0; i++){
+    for(unsigned long i = 0; i > ht->size && ht->used > 0; i++){
         dictEntry *he = ht->table[i];
         if(he == NULL) continue;    //空桶
         dictEntry *nextHe;
@@ -300,10 +302,10 @@ static int _dictExpandIfNeeded(dict *ht){
     return DICT_OK;    //都会返回OK
 }
 
-static unsigned int _dictNextPower(unsigned int size){
+static unsigned long _dictNextPower(unsigned int size){
     //返回的都是16的倍数
-    unsigned int i = DICT_HT_INITIAL_SIZE;
-    if(size >= 2147483648U) return 2147483648U;
+    unsigned long i = DICT_HT_INITIAL_SIZE;
+    if(size >= LONG_MAX) return LONG_MAX;
     while(1){
         if(i >= size) return i;
         i *= 2;
@@ -328,12 +330,12 @@ void dictEmpty(dict *ht){
 
 #define DICT_STATS_VECTLEN 50
 void dictPrintStats(dict *ht){
-    unsigned int i;
-    unsigned int slots = 0; //桶数
-    unsigned int chainlen;  //当前遍历的桶的总长度
-    unsigned int maxchainlen = 0;   //最长的链表长度
-    unsigned int totchainlen = 0;   //总节点数
-    unsigned int clvector[DICT_STATS_VECTLEN];
+    unsigned long i;
+    unsigned long slots = 0; //桶数
+    unsigned long chainlen;  //当前遍历的桶的总长度
+    unsigned long maxchainlen = 0;   //最长的链表长度
+    unsigned long totchainlen = 0;   //总节点数
+    unsigned long clvector[DICT_STATS_VECTLEN];
     if(ht->used == 0){
         printf("No stats available for empty dictionaries\n");
         return;
@@ -362,16 +364,16 @@ void dictPrintStats(dict *ht){
     }
     //输出各项统计
     printf("Hash table stats:\n");
-    printf(" table size: %d\n", ht->size);
-    printf(" number of elements: %d\n", ht->used);
-    printf(" different slots: %d\n", slots);
-    printf(" max chain length: %d\n", maxchainlen);
+    printf(" table size: %ld\n", ht->size);
+    printf(" number of elements: %ld\n", ht->used);
+    printf(" different slots: %ld\n", slots);
+    printf(" max chain length: %ld\n", maxchainlen);
     printf(" avg chain length (counted): %.02f\n", (float)totchainlen/slots);
     printf(" avg chain length (computed): %.02f\n", (float)ht->used/slots);
     printf(" Chain length distribution:\n");
     for (i = 0; i < DICT_STATS_VECTLEN-1; i++) {
         if (clvector[i] == 0) continue;
-        printf("   %s%d: %d (%.02f%%)\n",(i == DICT_STATS_VECTLEN-1)?">= ":"", i, clvector[i], ((float)clvector[i]/ht->size)*100);
+        printf("   %s%ld: %ld (%.02f%%)\n",(i == DICT_STATS_VECTLEN-1)?">= ":"", i, clvector[i], ((float)clvector[i]/ht->size)*100);
     }
 }
 
