@@ -1,4 +1,5 @@
-#define _GNU_SOURCE
+#include "fmacros.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -14,11 +15,6 @@
 
 #define LEDIS_CMD_INLINE 1
 #define LEDIS_CMD_BULK 2
-#define LEDIS_CMD_INTREPLY 4
-#define LEDIS_CMD_RETCODEREPLY 8
-#define LEDIS_CMD_BULKREPLY 16
-#define LEDIS_CMD_MULTIBULKREPLY 32
-#define LEDIS_CMD_SINGLELINEREPLY 64
 
 #define LEDIS_NOTUSED(V) ((void) V)
 
@@ -34,53 +30,56 @@ struct ledisCommand{
 };
 
 static struct ledisCommand cmdTable[] = {
-    {"get",2,LEDIS_CMD_INLINE|LEDIS_CMD_BULKREPLY},
-    {"set",3,LEDIS_CMD_BULK|LEDIS_CMD_RETCODEREPLY},
-    {"setnx",3,LEDIS_CMD_BULK|LEDIS_CMD_INTREPLY},
-    {"del",2,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"exists",2,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"incr",2,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"decr",2,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"rpush",3,LEDIS_CMD_BULK|LEDIS_CMD_RETCODEREPLY},
-    {"lpush",3,LEDIS_CMD_BULK|LEDIS_CMD_RETCODEREPLY},
-    {"rpop",2,LEDIS_CMD_INLINE|LEDIS_CMD_BULKREPLY},
-    {"lpop",2,LEDIS_CMD_INLINE|LEDIS_CMD_BULKREPLY},
-    {"llen",2,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"lindex",3,LEDIS_CMD_INLINE|LEDIS_CMD_BULKREPLY},
-    {"lset",4,LEDIS_CMD_BULK|LEDIS_CMD_RETCODEREPLY},
-    {"lrange",4,LEDIS_CMD_INLINE|LEDIS_CMD_MULTIBULKREPLY},
-    {"ltrim",4,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"lrem",4,LEDIS_CMD_BULK|LEDIS_CMD_INTREPLY},
-    {"sadd",3,LEDIS_CMD_BULK|LEDIS_CMD_INTREPLY},
-    {"srem",3,LEDIS_CMD_BULK|LEDIS_CMD_INTREPLY},
-    {"sismember",3,LEDIS_CMD_BULK|LEDIS_CMD_INTREPLY},
-    {"scard",2,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"sinter",-2,LEDIS_CMD_INLINE|LEDIS_CMD_MULTIBULKREPLY},
-    {"sinterstore",-3,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"smembers",2,LEDIS_CMD_INLINE|LEDIS_CMD_MULTIBULKREPLY},
-    {"incrby",3,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"decrby",3,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"randomkey",1,LEDIS_CMD_INLINE|LEDIS_CMD_SINGLELINEREPLY},
-    {"select",2,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"move",3,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"rename",3,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"renamenx",3,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"keys",2,LEDIS_CMD_INLINE|LEDIS_CMD_BULKREPLY},
-    {"dbsize",1,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"ping",1,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"echo",2,LEDIS_CMD_BULK|LEDIS_CMD_BULKREPLY},
-    {"save",1,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"bgsave",1,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"shutdown",1,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"lastsave",1,LEDIS_CMD_INLINE|LEDIS_CMD_INTREPLY},
-    {"type",2,LEDIS_CMD_INLINE|LEDIS_CMD_SINGLELINEREPLY},
-    {"flushdb",1,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"flushall",1,LEDIS_CMD_INLINE|LEDIS_CMD_RETCODEREPLY},
-    {"sort",-2,LEDIS_CMD_INLINE|LEDIS_CMD_MULTIBULKREPLY},
-    {"info",1,LEDIS_CMD_INLINE|LEDIS_CMD_BULKREPLY},
-    {"mget",-2,LEDIS_CMD_INLINE|LEDIS_CMD_MULTIBULKREPLY},
+    {"get",2,LEDIS_CMD_INLINE},
+    {"set",3,LEDIS_CMD_BULK},
+    {"setnx",3,LEDIS_CMD_BULK},
+    {"del",2,LEDIS_CMD_INLINE},
+    {"exists",2,LEDIS_CMD_INLINE},
+    {"incr",2,LEDIS_CMD_INLINE},
+    {"decr",2,LEDIS_CMD_INLINE},
+    {"rpush",3,LEDIS_CMD_BULK},
+    {"lpush",3,LEDIS_CMD_BULK},
+    {"rpop",2,LEDIS_CMD_INLINE},
+    {"lpop",2,LEDIS_CMD_INLINE},
+    {"llen",2,LEDIS_CMD_INLINE},
+    {"lindex",3,LEDIS_CMD_INLINE},
+    {"lset",4,LEDIS_CMD_BULK},
+    {"lrange",4,LEDIS_CMD_INLINE},
+    {"ltrim",4,LEDIS_CMD_INLINE},
+    {"lrem",4,LEDIS_CMD_BULK},
+    {"sadd",3,LEDIS_CMD_BULK},
+    {"srem",3,LEDIS_CMD_BULK},
+    {"sismember",3,LEDIS_CMD_BULK},
+    {"scard",2,LEDIS_CMD_INLINE},
+    {"sinter",-2,LEDIS_CMD_INLINE},
+    {"sinterstore",-3,LEDIS_CMD_INLINE},
+    {"smembers",2,LEDIS_CMD_INLINE},
+    {"incrby",3,LEDIS_CMD_INLINE},
+    {"decrby",3,LEDIS_CMD_INLINE},
+    {"randomkey",1,LEDIS_CMD_INLINE},
+    {"select",2,LEDIS_CMD_INLINE},
+    {"move",3,LEDIS_CMD_INLINE},
+    {"rename",3,LEDIS_CMD_INLINE},
+    {"renamenx",3,LEDIS_CMD_INLINE},
+    {"keys",2,LEDIS_CMD_INLINE},
+    {"dbsize",1,LEDIS_CMD_INLINE},
+    {"ping",1,LEDIS_CMD_INLINE},
+    {"echo",2,LEDIS_CMD_BULK},
+    {"save",1,LEDIS_CMD_INLINE},
+    {"bgsave",1,LEDIS_CMD_INLINE},
+    {"shutdown",1,LEDIS_CMD_INLINE},
+    {"lastsave",1,LEDIS_CMD_INLINE},
+    {"type",2,LEDIS_CMD_INLINE},
+    {"flushdb",1,LEDIS_CMD_INLINE},
+    {"flushall",1,LEDIS_CMD_INLINE},
+    {"sort",-2,LEDIS_CMD_INLINE},
+    {"info",1,LEDIS_CMD_INLINE},
+    {"mget",-2,LEDIS_CMD_INLINE},
+    {"expire",3,LEDIS_CMD_INLINE},
     {NULL,0,0}
 };
+
+static int cliReadReply(int fd);
 
 static struct ledisCommand *lookupCommand(char *name){
     int i = 0;
@@ -130,14 +129,11 @@ static sds cliReadLine(int fd){
  * 读取并输出inline类型的reply（包含3种，对应SINGLELINE，INT和RETCODE）
  * 返回0说明正常，返回1说明不正常
  */ 
-static int cliReadInlineReply(int fd, int type){
+static int cliReadSingleLineReply(int fd, int type){
 
     sds reply = cliReadLine(fd);
     if(reply == NULL) return 1;
     printf("%s\n", reply);
-    if(type == LEDIS_CMD_SINGLELINEREPLY) return 0; //对的
-    if(type == LEDIS_CMD_INTREPLY) return atoi(reply) < 0;  //如果是负数，说明是错误，要返回1
-    if(type == LEDIS_CMD_RETCODEREPLY) return reply[0] == '-';  //如果是-，说明是错误，要返回1
     return 0;
 }
 
@@ -145,27 +141,19 @@ static int cliReadInlineReply(int fd, int type){
  * 读取并输出bulk类型的reply（包含BULK），MULTIBULK也会调用，但是只能取到一部分数据
  * 返回0说明正常，返回1说明不正常
  */ 
-static int cliReadBulkReply(int fd, int multibulk){
+static int cliReadBulkReply(int fd){
 
-    int error = 0; //错误标记
     sds replylen = cliReadLine(fd); //先读取bulk的长度信息，也可能是nil
 
     if(replylen == NULL) return 1; 
-    if(strcmp(replylen, "nil") == 0){
-        sdsfree(replylen);
-        printf("(nil)\n");
-        return 0;   //正常
-    }
+    
     int bulklen = atoi(replylen);
-    if(multibulk && bulklen == -1){ //如果是多行bulk，bulklen应该是集合的长度，而不是信息大小
+    if(bulklen == -1){ //如果是多行bulk，bulklen应该是集合的长度，而不是信息大小
         sdsfree(replylen);
         printf("(nil)");    //multi来的，没有换行
         return 0;   //正常
     }
-    if(bulklen < 0){    //server返回错误信息，是通过将bulklen变成负值来标识，但是信息还是有用的
-        bulklen = -bulklen;
-        error = 1;
-    }
+    
     char *reply = zmalloc(bulklen); //信息长度是动态的
     char crlf[2];
     //读取实际信息
@@ -175,30 +163,57 @@ static int cliReadBulkReply(int fd, int multibulk){
         zfree(reply);
         return 1;
     }
-    if(!multibulk && isatty(fileno(stdout)) && reply[bulklen-1] != '\n'){
+    if(isatty(fileno(stdout)) && reply[bulklen-1] != '\n'){
         printf("\n");
     }
     zfree(reply);
-    return error;
+    return 0;
 }
 
 static int cliReadMultiBulkReply(int fd){
     sds replylen = cliReadLine(fd);
     if(replylen == NULL) return 1;
-    if(strcmp(replylen, "nil") == 0){
+
+    int elements = atoi(replylen);
+    if(elements == -1){
         sdsfree(replylen);
         printf("(nil)\n");
         return 0;
     }
+    if(elements == 0){
+        printf("(empty list or set)\n");
+    }
 
-    int elements = atoi(replylen);  //容器的长度
     int c = 1;
     while(elements--){
         printf("%d. ", c);  //前缀编号
-        if(cliReadBulkReply(fd, 1)) return 1;   //如果内部返回1（错误），直接也返回错误
+        if(cliReadReply(fd)) return 1;   //如果内部返回1（错误），直接也返回错误
         printf("\n");
     }
     return 0;
+}
+
+static int cliReadReply(int fd){
+    char type;
+    //读第1个字符，表示信息类型
+    if(anetRead(fd, &type, 1) <= 0) exit(EXIT_SUCCESS);
+    switch(type){
+        case '-':{
+            printf("(error)");
+            cliReadSingleLineReply(fd);
+            return 1;
+        }
+        case '+':
+        case ':':
+            return cliReadSingleLineReply(fd);
+        case '$':{
+            return cliReadMultiBulkReply(fd);
+        }
+        default:{
+            printf("protocol error, get '%c' as reply type byte\n", type);
+            return 1;
+        }
+    }
 }
 
 /**
@@ -238,18 +253,7 @@ static int cliSendCommand(int argc, char **argv){
     }
     anetWrite(fd, cmd, sdslen(cmd));
     //准备读取
-    int retval = 0;
-    if(lc->flags & LEDIS_CMD_INTREPLY){
-        retval = cliReadInlineReply(fd, LEDIS_CMD_INTREPLY);
-    }else if(lc->flags & LEDIS_CMD_RETCODEREPLY){
-        retval = cliReadInlineReply(fd, LEDIS_CMD_RETCODEREPLY);
-    }else if(lc->flags & LEDIS_CMD_SINGLELINEREPLY){
-        retval = cliReadInlineReply(fd, LEDIS_CMD_SINGLELINEREPLY);
-    }else if(lc->flags & LEDIS_CMD_BULKREPLY){
-        retval = cliReadBulkReply(fd, 0);
-    }else if(lc->flags & LEDIS_CMD_MULTIBULKREPLY){
-        retval = cliReadMultiBulkReply(fd);
-    }
+    int retval = cliReadReply(fd);
     if(retval){
         close(fd);
         return retval;

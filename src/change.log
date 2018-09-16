@@ -6,6 +6,7 @@
 新功能：
 1.增加了新的命令smove/sunion/sunionstore/sdiff/sdiffstore/getSet/ttl/slaveof
 2.所有的log输出，增加了当前时间前缀。
+3.主从同步方式进行了彻底重写。
 修改BUG：无
 代码调整：
 1.list结构增加了内部的迭代器，同时增加了配置rewind/rewindTail/yield操作函数。
@@ -15,6 +16,8 @@
 5.del命令支持传多个key了，而不是原来的1个。
 6.emptyDb函数，会返回清空前所有库节点的总数。
 7.incrby和decrby的增减量，由int改成long long，范围大多了。
+8.flushDb和flushAll会让dirty增加原来所有节点数，而不是1个了，同时flushDb并不会自动save了，因为dirty巨变很可能触发自动的bgsave。
+9.增加Linux平台下，如果不开启overcommit_memory的警告提示。
 
 0.96变化
 修改BUG：
@@ -57,7 +60,8 @@ beta-9变化
 6.dict的获取槽数和已用节点数的宏名，改成了更简洁的dictSlots和dictSize。
 7.server和client结构中dict变成了ledisDb结构，封装了一层。
 8.增加了对key实际值访问的函数（同时也处理expire的情况），因此几乎所有command都发生了调整。
-9.shared静态字符串对象有了很大变动。
+9.shared静态字符串对象有了很大变动，定义了一套完整的传输格式，用不同的符号前缀表示不同的返回类型。
+10.返回值用符号来表示信息类型，因此ledis-cli也简化了，不需要定义明确的返回类型了。
 
 beta-8变化
 新的配置：

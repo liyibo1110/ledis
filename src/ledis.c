@@ -926,7 +926,7 @@ static void initServer(){
 /**
  * 清空server的所有dict
  */ 
-static void emptyDb(){
+static long long emptyDb(){
 
     long long removed = 0;
     for(int i = 0; i < server.dbnum; i++){
@@ -1554,7 +1554,7 @@ static ledisClient *createClient(int fd){
 }
 
 static void addReply(ledisClient *c, lobj *obj){
-    //client如果是从，则必须是ONLINE状态才能去回复
+    //client如果是从，则必须是ONLINE状态才能去回复，否则说明在为了从而进行bgsave，只会往c->reply追加暂存而不会真的返回
     if(listLength(c->reply) == 0 && 
         (c->replstate == LEDIS_REPL_NONE ||
          c->replstate == LEDIS_REPL_ONLINE) &&
@@ -2445,7 +2445,7 @@ static void delCommand(ledisClient *c){
     for(int i = 1; i < c->argc; i++){
         if(deleteKey(c->db, c->argv[i])){
             server.dirty++;
-            deleted++
+            deleted++;
         }
     }
     switch(deleted){
@@ -3195,27 +3195,113 @@ static void sinterstoreCommand(ledisClient *c){
  */ 
 static void sunionDiffGenericCommand(ledisClient *c, lobj **setskeys, int setsnum, lobj *dstkey, int op){
 
-    dict **dv = zmalloc(sizeof(dict*)*setsnum);
+    dictIterator *di;
+    dictEntry *de;
+    int cardinality = 0;    //结果集合的大小
+    dict **dv = zmalloc(sizeof(dict*)*setsnum); //各个set的容器
     if(!dv) oom("sunionDiffGenericCommand");
-    
+    for(int i = 0; i < setsnum; i++){
+        lobj *setobj = dstkey ? 
+                    lookupKeyWrite(c->db, setskeys[i]) : 
+                    lookupKeyRead(c->db, setskeys[i]);
+        if(!setobj){
+            dv[i] = NULL;
+            continue;
+        }
+        //入参对应的数据类型不能错
+        if(setobj->type != LEDIS_SET){
+            zfree(dv);
+            addReply(c, shared.wrongtypeerr);
+            return;
+        }
+        dv[i] = setobj->ptr;
+    }
+    lobj *dstset = createSetObject();
+    for(int j = 0; j < setsnum; j++){
+        //如果diff，第一个SET不能为空（因为sdiff是求第1个SET和后面其他SET的差集的）
+        if(op == LEDIS_OP_DIFF && j == 0 && !dv[j]) break;
+        if(!dv[j]) continue;
+
+        di = dictGetIterator(dv[j]);
+        if(!di) oom("dictGetIterator");
+        while((de = dictNext(di)) != NULL){
+            lobj *ele = dictGetEntryKey(de);
+            //不管是union和diff，第1个SET开始都是完整的，遍历从第2个SET开始才有操作区别
+            if(op == LEDIS_OP_UNION || j == 0){
+                if(dictAdd(dstset->ptr, ele, NULL) == DICT_OK){
+                    incrRefCount(ele);
+                    cardinality++;
+                }
+            }else if(op == LEDIS_OP_DIFF){  //从第2个SET才有可能进来
+                if(dictDelete(dstset->ptr, ele) == DICT_OK){
+                    cardinality--;
+                }
+            }
+        }
+        dictReleaseIterator(di);
+        //对于diff，如果一轮操作结果集合已经没有元素了，后面也就不需要操作了，肯定也是空
+        if(op == LEDIS_OP_DIFF && cardinality == 0) break;
+    }
+
+    if(!dstkey){
+        addReplySds(c, sdscatprintf(sdsempty(), "*%d\r\n", cardinality));
+        di = dictGetIterator(dstset->ptr);
+        if(!di) oom("dictGetIterator");
+        while((de = dictNext(di)) != NULL){
+            lobj *ele = dictGetEntryKey(de);
+            addReplySds(c, sdscatprintf(sdsempty(), "$%d\r\n", sdslen(ele->ptr)));
+            addReply(c, ele);
+            addReply(c, shared.crlf);
+        }
+        dictReleaseIterator(di);
+    }else{
+        deleteKey(c->db, dstkey);   //先清空已有的
+        dictAdd(c->db->dict, dstkey, dstset);
+        incrRefCount(dstkey);   //dstset为什么不引用+1？？？在后面还会有decrRefCount
+    }
+
+    //清理
+    if(!dstkey){
+        decrRefCount(dstset);
+    }else{
+        addReplySds(c, sdscatprintf(sdsempty(), ":%d\r\n", 
+                    dictSize((dict*)dstset->ptr)));
+        server.dirty++;
+    }
+    zfree(dv);
+}
+
+static void sunionCommand(ledisClient *c){
+    sunionDiffGenericCommand(c, c->argv+1, c->argc-1, NULL, LEDIS_OP_UNION);
+}
+
+static void sunionstoreCommand(ledisClient *c){
+    sunionDiffGenericCommand(c, c->argv+2, c->argc-2, c->argv[1], LEDIS_OP_UNION);
+}
+
+static void sdiffCommand(ledisClient *c){
+    sunionDiffGenericCommand(c, c->argv+1, c->argc-1, NULL, LEDIS_OP_DIFF);
+}
+
+static void sdiffstoreCommand(ledisClient *c){
+    sunionDiffGenericCommand(c, c->argv+2, c->argc-2, c->argv[1], LEDIS_OP_DIFF);
 }
 
 static void flushdbCommand(ledisClient *c){
+    server.dirty += dictSize(c->db->dict);
     //清空当前的DB
     dictEmpty(c->db->dict);
     dictEmpty(c->db->expires);
-    server.dirty++;
     addReply(c, shared.ok);
-    //强制save
-    ldbSave(server.dbfilename); 
+    //不会再save了，dirty巨变很可能直接触发bgsave
 }
 
 static void flushallCommand(ledisClient *c){
-    emptyDb();
-    server.dirty++;
+    server.dirty += emptyDb();
     addReply(c, shared.ok);
     //强制save
     ldbSave(server.dbfilename);
+    server.dirty++; //啥意思？
 }
 
 ledisSortOperation *createSortOperation(int type, lobj *pattern){
@@ -3381,13 +3467,13 @@ static void sortCommand(ledisClient *c){
     j = 0;
     if(sortval->type == LEDIS_LIST){
         list *list = sortval->ptr;
-        listNode *ln = list->head;
-        while(ln){
+        listNode *ln;
+        listRewind(list);
+        while((ln = listYield(list))){
             lobj *ele = ln->value;
             vector[j].obj = ele;    //并不会增加ele的引用
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
-            ln = ln->next;
             j++;
         }
     }else{
@@ -3411,7 +3497,7 @@ static void sortCommand(ledisClient *c){
                 //根据pattern寻找pattern动态键的val
                 lobj *byval = lookupKeyByPattern(c->db, sortby, vector[j].obj);
                 if(!byval || byval->type != LEDIS_STRING) continue;
-                if(alpha){  //按字母排，则
+                if(alpha){  //按字母排
                     vector[j].u.cmpobj = byval;
                     incrRefCount(byval);
                 }else{
@@ -3440,7 +3526,12 @@ static void sortCommand(ledisClient *c){
         server.sort_desc = desc;
         server.sort_alpha = alpha;
         server.sort_bypattern = sortby ? 1 : 0;
-        qsort(vector, vectorlen, sizeof(ledisSortObject), sortCompare);
+        //如果传了BY，同时还传了有效的LIMIT，则改用pgsort来排序
+        if(sortby && (start != 0 || end != vectorlen-1)){
+            pqsort(vector, vectorlen, sizeof(ledisSortObject), sortCompare, start, end);
+        }else{
+            qsort(vector, vectorlen, sizeof(ledisSortObject), sortCompare);
+        }
     }
 
     //直接算出最终输出的数目
@@ -3448,7 +3539,7 @@ static void sortCommand(ledisClient *c){
     addReplySds(c, sdscatprintf(sdsempty(), "*%d\r\n", outputlen));
     //输出实际数据
     for(j = start; j <= end; j++){
-        listNode *ln = operations->head;
+        listNode *ln;
         //输出常规内容
         if(!getop){
             addReplySds(c, sdscatprintf(sdsempty(), "$%d\r\n", sdslen(vector[j].obj->ptr)));
@@ -3456,7 +3547,8 @@ static void sortCommand(ledisClient *c){
             addReply(c, shared.crlf);
         }
         //输出运算参数对应的内容
-        while(ln){
+        listRewind(operations);
+        while(ln = listYield(operations)){
             ledisSortOperation *sop = ln->value;
             lobj *val = lookupKeyByPattern(c->db, sop->pattern, vector[j].obj);
             if(sop->type == LEDIS_SORT_GET){
@@ -3470,7 +3562,6 @@ static void sortCommand(ledisClient *c){
             }else if(sop->type == LEDIS_SORT_DEL){
                 //目前没这个功能
             }
-            ln = ln->next;
         }
     }
 
@@ -3491,25 +3582,43 @@ static void infoCommand(ledisClient *c){
     time_t uptime = time(NULL)-server.stat_starttime;
     sds info = sdscatprintf(sdsempty(), 
                 "ledis_version:%s\r\n"
+                "uptime_in_seconds:%d\r\n"
+                "uptime_in_days:%d\r\n",
                 "connected_clients:%d\r\n"
                 "connected_slaves:%d\r\n"
                 "used_memory:%zu\r\n"
                 "changes_since_last_save%lld\r\n"
+                "bgsave_in_progress:%d\r\n"
                 "last_save_time:%d\r\n"
                 "total_connections_received:%lld\r\n"
                 "total_commands_processed:%lld\r\n"
-                "uptime_in_seconds:%d\r\n"
-                "uptime_in_days:%d\r\n",
+                
                 LEDIS_VERSION,
+                uptime,
+                uptime/(3600*24),
                 listLength(server.clients)-listLength(server.slaves),
                 listLength(server.slaves),
                 server.usedmemory,
                 server.dirty,
+                server.bgsaveinprogress,
                 server.lastsave,
                 server.stat_numconnections,
                 server.stat_numcommands,
-                uptime,
-                uptime/(3600*24));
+                server.masterhost == NULL ? "master" :"slave"
+                );
+
+    if(server.masterhost){
+        info = sdscatprintf(info, 
+                "master_host:%s\r\n"
+                "master_port:%d\r\n"
+                "master_link_status:%s\r\n"
+                "master_last_io_seconds_age:%d\r\n",
+                server.masterhost,
+                server.masterport,
+                (server.replstate == LEDIS_REPL_CONNECTED) ? 
+                    "up" : "down",
+                (int)(time(NULL)-server.master->lastinteraction));
+    }
     addReplySds(c, sdscatprintf(sdsempty(), "$%d\r\n", sdslen(info)));
     addReplySds(c, info);
     addReply(c, shared.crlf);
@@ -3616,6 +3725,15 @@ static void expireCommand(ledisClient *c){
     }
 }
 
+static void ttlCommand(ledisClient *c){
+    int ttl = -1;
+    time_t expire = getExpire(c->db, c->argv[1]);
+    if(expire != -1){
+        ttl = (int)(expire-time(NULL));
+        if(ttl < 0) ttl = -1;
+    }
+    addReplySds(c, sdscatprintf(sdsempty(), ":%d\r\n", ttl));
+}
 
 /*====================================== 主从相关 ===============================*/
 
@@ -3713,50 +3831,154 @@ static int syncReadLine(int fd, char *ptr, ssize_t size, int timeout){
 }
 
 static void syncCommand(ledisClient *c){
-    
-    struct stat sb;
-    int fd = -1;
-    time_t start = time(NULL);
-    char sizebuf[32];   //dump文件的大小
-    
-    //从或者monitor不需要收到SYNC命令，只有主会收到
+
+    //如果客户端已经标记为从，则不会再次处理（也就是说只有从初始化时候才可以调用一次）
     if(c->flags & LEDIS_SLAVE) return;
-    
+    //客户端不能有别的回复数据
+    if(listLength(c->reply) != 0){
+        addReplySds(c, sdsnew("-ERR SYNC is invalid with pending input\r\n"));
+        return;
+    }
+
     ledisLog(LEDIS_NOTICE, "slave ask for syncronization");
-    if(flushClientOutput(c) == LEDIS_ERR || ldbSave(server.dbfilename) != LEDIS_OK){
-        goto closeconn;
+    //如果主正在bgsave，则要特殊处理
+    if(server.bgsaveinprogress){
+        ledisClient *slave;
+        listNode *ln;
+        listRewind(server.slaves);
+        //检测其他的从，有没有状态为WAIT_BGSAVE_END的
+        while((ln = listYield(server.slaves))){
+            slave = ln->value;
+            if(slave->replstate == LEDIS_REPL_WAIT_BGSAVE_END) break;
+        }
+        if(ln){ //有从的同步状态处于WAIT_BGSAVE_END
+            listRelease(c->reply);
+            c->reply = listDup(slave->reply);
+            if(!c->reply) oom("listDup copying slave reply list");
+            c->replstate = LEDIS_REPL_WAIT_BGSAVE_END;
+            ledisLog(LEDIS_NOTICE, "Waiting for end of BGSAVE for SYNC");
+        }else{
+            c->replstate = LEDIS_REPL_WAIT_BGSAVE_START;
+            ledisLog(LEDIS_NOTICE, "Waiting for next BGSAVE for SYNC");
+        }
+    }else{
+        ledisLog(LEDIS_NOTICE, "Starting BGSAVE for SYNC");
+        if(ldbSaveBackground(server.dbfilename) != LEDIS_OK){
+            ledisLog(LEDIS_NOTICE, "Replication failed, can't BGSAVE");
+            addReplySds(c, sdsnew("-ERR Unable to perform background save\r\n"));
+            return;
+        }
+        c->replstate = LEDIS_REPL_WAIT_BGSAVE_END;
     }
-
-    fd = open(server.dbfilename, O_RDONLY);
-    if(fd == -1 || fstat(fd, &sb) == -1) goto closeconn;
-    int len = sb.st_size;
-
-    snprintf(sizebuf, 32, "$%d\r\n", len);
-    //先返回文件大小
-    if(syncWrite(c->fd, sizebuf, strlen(sizebuf), 5) == -1) goto closeconn;
-    //直接传递整个ldb文件。。。
-    while(len){
-        char buf[1024];
-        
-        //60秒的同步时间
-        if(time(NULL)-start > LEDIS_MAX_SYNC_TIME) goto closeconn;
-        int nread = read(fd, buf, 1024);
-        if(nread == -1) goto closeconn;
-        len -= nread;
-        if(syncWrite(c->fd, buf, nread, 5) == -1) goto closeconn;
-    }
-    if(syncWrite(c->fd, "\r\n", 2, 5) == -1) goto closeconn;
-    close(fd);
+    c->repldbfd = -1;
     c->flags |= LEDIS_SLAVE;
     c->slaveseldb = 0;
     if(!listAddNodeTail(server.slaves, c)) oom("listAddNodeTail");
-    ledisLog(LEDIS_NOTICE, "Syncronization with slave succeeded");
     return;
-closeconn:
-    if(fd != -1) close(fd);
-    c->flags |= LEDIS_CLOSE;
-    ledisLog(LEDIS_WARNING, "Syncronization with slave failed");
-    return;
+}
+
+static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask){
+    
+    ledisClient *slave = privdata;
+    LEDIS_NOTUSED(el);
+    LEDIS_NOTUSED(mask);
+    char buf[LEDIS_IOBUF_LEN];
+    ssize_t nwritten;
+
+    if(slave->repldboff == 0){  //从还没有任何数据
+        sds bulkcount = sdscatprintf(sdsempty(), "$%lld\r\n", 
+                        (unsigned long long)slave->repldbsize);
+        if(write(fd, bulkcount, sdslen(bulkcount)) != (signed)sdslen(bulkcount)){
+            //失败了
+            sdsfree(bulkcount);
+            freeClient(slave);
+            return;
+        }
+        sdsfree(bulkcount); //write成功，就不需要了
+    }
+    lseek(slave->repldbfd, slave->repldboff, SEEK_SET);
+    ssize_t buflen = read(slave->repldbfd, buf, LEDIS_IOBUF_LEN);
+    if(buflen <= 0){
+        ledisLog(LEDIS_WARNING, "Read error sending DB to slave: %s", 
+            (buflen == 0) ? "premature EOF" : strerror(errno));
+        freeClient(slave);
+        return;
+    }
+    if((nwritten = write(fd, buf, buflen)) == -1){
+        ledisLog(LEDIS_DEBUG, "Write error sending DB to slave: %s", strerror(errno));
+        freeClient(slave);
+        return;
+    }
+    slave->repldboff += nwritten;
+    //每轮只会read/write一次，如果完事了再清理event，同时运行新的event
+    if(slave->repldboff == slave->repldbsize){
+        close(slave->repldbfd);
+        slave->repldbfd = -1;
+        aeDeleteFileEvent(server.el, slave->fd, AE_WRITABLE);
+        slave->replstate = LEDIS_REPL_ONLINE;   //置为db同步完毕
+        if(aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, 
+            sendReplyToClient, slave, NULL) == AE_ERR){
+            freeClient(slave);
+            return;
+        }
+        addReplySds(slave, sdsempty());
+        ledisLog(LEDIS_NOTICE, "Synchronization with slave succeeded");
+    }
+}
+
+/**
+ * 由serverCron中检测如果bgsave完成时才会调用
+ */ 
+static void updateSalvesWaitingBgsave(int bgsaveerr){
+
+    listNode *ln;
+    int startbgsave = 0;
+    listRewind(server.slaves);
+    while((ln = listYield(server.slaves))){
+        ledisClient *slave = ln->value;
+        if(slave->replstate == LEDIS_REPL_WAIT_BGSAVE_START){
+            //刚进行了bgsave，可以改变状态了
+            startbgsave = 1;
+            slave->replstate = LEDIS_REPL_WAIT_BGSAVE_END;
+        }else if(slave->replstate == LEDIS_REPL_WAIT_BGSAVE_END){
+            struct stat buf;
+            if(bgsaveerr != LEDIS_OK){  //说明bgsave失败了
+                freeClient(slave);
+                ledisLog(LEDIS_WARNING, "SYNC failed. BGSAVE child returned an error");
+                continue;
+            }
+            //说明bgsave正常返回
+            if((slave->repldbfd = open(server.dbfilename, O_RDONLY)) == -1 || 
+                fstat(slave->repldbfd, &buf) == -1){
+                freeClient(slave);
+                ledisLog(LEDIS_WARNING, "SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
+                continue;
+            }
+            slave->repldboff = 0;
+            slave->repldbsize = buf.st_size;
+            slave->replstate = LEDIS_REPL_SEND_BULK;
+            aeDeleteFileEvent(server.el, slave->fd, AE_WRITABLE);
+            //开始间歇性的启动DB文件复制给从的函数
+            if(aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, 
+                sendBulkToSlave, slave, NULL) == AE_ERR){
+                freeClient(slave);
+                continue;
+            }
+        }
+    }
+    //如果没有bgsave在执行，则开始执行，如果发生错误，则清理相应的从客户端
+    if(startbgsave){
+        if(ldbSaveBackground(server.dbfilename) != LEDIS_OK){
+            listRewind(server.slaves);
+            ledisLog(LEDIS_WARNING, "SYNC failed. BGSAVE failed");
+            while((ln = listYield(server.slaves))){
+                ledisClient *slave = ln->value;
+                if(slave->replstate == LEDIS_REPL_WAIT_BGSAVE_START){
+                    freeClient(slave);
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -3777,7 +3999,7 @@ static int syncWithMaster(void){
         return LEDIS_ERR;
     }
     //获取相应数据
-    if(syncReadLine(fd, buf, 1024, 5) == -1){
+    if(syncReadLine(fd, buf, 1024, 3600) == -1){
         close(fd);
         ledisLog(LEDIS_WARNING, "I/O error reading bulk count from MASTER: %s", 
                     strerror(errno));
@@ -3836,7 +4058,51 @@ static int syncWithMaster(void){
     return LEDIS_OK;
 }
 
+static void slaveofCommand(ledisClient *c){
+    //参数为no和one，说明要取消从，变成普通的主
+    if(!strcasecmp(c->argv[1]->ptr, "no") && 
+        !strcasecmp(c->argv[2]->ptr, "one")){
+        if(server.masterhost){  //已经配了主，则先清除
+            sdsfree(server.masterhost);
+            server.masterhost = NULL;
+            if(server.master) freeClient(server.master);
+            server.replstate = LEDIS_REPL_NONE;
+            ledisLog(LEDIS_NOTICE, "MASTER MODE enabled (user request)");
+        }
+    }else{  //否则将主配置成参数指定的ip和port
+        sdsfree(server.masterhost);
+        server.masterhost = sdsdup(c->argv[1]->ptr);
+        server.masterport = atoi(c->argv[2]->ptr);
+        if(server.master) freeClient(server.master);
+        server.replstate = LEDIS_REPL_CONNECT;
+        ledisLog(LEDIS_NOTICE, "SLAVE OF %s:%d enabled (user request)", 
+                    server.masterhost, server.masterport);
+    }
+    addReply(c, shared.ok);
+}
+
 /*====================================== 主函数 ===============================*/
+
+#ifdef __linux__
+int linuxOvercommitMemoryValue(void){
+    FILE *fp = fopen("/proc/sys/vm/overcommit_memory", "r");
+    char buf[64];
+
+    if(!fp) return -1;
+    if(fgets(buf, 64, fp) == NULL){
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return atoi(buf);
+}
+
+void linuxOvercommitMemoryWarning(void){
+    if(linuxOvercommitMemoryValue() == 0){
+        ledisLog(LEDIS_WARNING, "WARNING overcommit_memory is set to 0! Background save may fail under low condition memory. To fix this issue add 'echo 1 > /proc/sys/vm/overcommit_memory' in your init scripts.");
+    }
+}
+#endif
 
 /**
  * 将当前进程弄成daemon，用的是"古典"方法
@@ -3863,6 +4129,10 @@ static void daemonize(void){
 
 int main(int argc, char *argv[]){
 
+#ifdef __linux__
+    linuxOvercommitMemoryWarning();
+#endif
+
     LEDIS_NOTUSED(argc);
     LEDIS_NOTUSED(argv);
     //初始化server配置
@@ -3873,6 +4143,8 @@ int main(int argc, char *argv[]){
     }else if(argc > 2){
         fprintf(stderr, "Usage: ./ledis-server [/path/to/ledis.conf]\n");
         exit(EXIT_FAILURE);
+    }else{
+        ledisLog(LEDIS_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use 'ledis-server.out /path/to/ledis.conf'");
     }
     //初始化server
     initServer();
