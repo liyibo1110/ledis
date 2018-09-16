@@ -1,4 +1,5 @@
-#define _GNU_SOURCE
+#include "fmacros.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,6 +36,8 @@ static struct config{
     int donerequests;
     int keysize;
     int datasize;
+    int randomkeys;
+    int randomkeys_keyspacelen;
     aeEventLoop *el;
     char *hostip;
     int hostport;
@@ -111,6 +114,21 @@ static void resetClient(client c){
     c->written = 0;
     c->state = CLIENT_SENDQUERY;
     c->start = mstime();
+    createMissingClients(c);
+}
+
+/**
+ * 给客户端的_rand标志字符串后面，追加随机的填充字符
+ */ 
+static void randomizeClientKey(client c){
+    char buf[32];
+
+    char *p = strstr(c->obuf, "_rand");
+    if(!p) return;
+    p += 5;
+    long r = random() % config.randomkeys_keyspacelen;
+    sprintf(buf, "%ld", r);
+    memcpy(p, buf, strlen(buf));
 }
 
 /**
@@ -130,6 +148,7 @@ static void clientDone(client c){
     }
     if(config.keepalive){
         resetClient(c);
+        if(config.randomkeys) randomizeClientKey(c);
     }else{
         config.liveclients--;
         createMissingClients(c);
@@ -170,7 +189,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask){
                 *p = '\0';
                 *(p-1) = '\0';  //将reply字符串中的\r\n去掉
                 c->readlen = atoi(c->ibuf+1)+2; //加1是为了跳过返回信息的特殊标识符号
-                if(c->readlen == -1){
+                if(c->readlen-2 == -1){
                     clientDone(c);
                     return;
                 }
@@ -257,6 +276,7 @@ static void createMissingClients(client c){
         if(!new) continue;
         sdsfree(new->obuf); //安全
         new->obuf = sdsdup(c->obuf);
+        if(config.randomkeys) randomizeClientKey(c);
         new->replytype = c->replytype;
         if(c->replytype == REPLY_BULK) new->readlen = -1;
     }
@@ -339,6 +359,10 @@ void parseOptions(int argc, char **argv){
             i++;
             if(config.datasize < 1) config.datasize = 1;
             if(config.datasize > 1024 * 1024) config.datasize = 1024 * 1024;
+        }else if (!strcmp(argv[i], "-r" && !lastarg)){
+            config.randomkeys = 1;
+            config.randomkeys_keyspacelen = atoi(argv[i+1]);
+            i++;
         }else if(!strcmp(argv[i], "-q")){
             config.quiet = 1;
         }else if(!strcmp(argv[i], "-l")){
@@ -352,6 +376,13 @@ void parseOptions(int argc, char **argv){
             printf(" -n <requests>      Total number of requests (default 10000)\n");
             printf(" -d <size>          Data size of SET/GET value in bytes (default 2)\n");
             printf(" -k <boolean>       1=keep alive 0=reconnect (default 1)\n");
+            printf(" -r <keyspacelen>   Use random keys for SET/GET/INCR\n");
+            printf("  Using this option the benchmark will get/set keys\n");
+            printf("  in the form mykey_rand000000012456 instead of constant\n");
+            printf("  keys, the <keyspacelen> argument determines the max\n");
+            printf("  number of values for the random number. For instance\n");
+            printf("  if set to 10 only rand000000000000 - rand000000000009\n");
+            printf("  range will be allowed.\n");
             printf(" -q                 Quiet. Just show query/sec values\n");
             printf(" -l                 Loop. Run the tests forever\n");
             exit(EXIT_FAILURE);
@@ -371,6 +402,8 @@ int main(int argc, char **argv){
     config.keepalive = 1;
     config.donerequests = 0;
     config.datasize = 3;
+    config.randomkeys = 0;
+    config.randomkeys_keyspacelen = 0;
     config.quiet = 0;
     config.loop = 0;
     config.clients = listCreate();
@@ -401,7 +434,7 @@ int main(int argc, char **argv){
         prepareForBenchmark();
         c = createClient(); //创建一个client
         if(!c) exit(EXIT_FAILURE);
-        c->obuf = sdscatprintf(c->obuf, "SET foo %d\r\n", config.datasize);
+        c->obuf = sdscatprintf(c->obuf, "SET foo_rand000000000000 %d\r\n", config.datasize);
         {
             char *data = zmalloc(config.datasize+2); //还有\r\n
             memset(data, 'x', config.datasize); //用字符x填充datasize个
@@ -418,7 +451,7 @@ int main(int argc, char **argv){
         prepareForBenchmark();
         c = createClient();
         if(!c) exit(EXIT_FAILURE);
-        c->obuf = sdscat(c->obuf, "GET foo\r\n");
+        c->obuf = sdscat(c->obuf, "GET foo_rand000000000000\r\n");
         c->replytype = REPLY_BULK;  //返回类型是bulk了
         c->readlen = -1;
         createMissingClients(c);
@@ -429,7 +462,7 @@ int main(int argc, char **argv){
         prepareForBenchmark();
         c = createClient();
         if(!c) exit(EXIT_FAILURE);
-        c->obuf = sdscat(c->obuf, "INCR counter\r\n");
+        c->obuf = sdscat(c->obuf, "INCR counter_rand000000000000\r\n");
         c->replytype = REPLY_INT;  //返回类型是int了
         createMissingClients(c);
         aeMain(config.el);

@@ -33,7 +33,7 @@ static struct ledisCommand cmdTable[] = {
     {"get",2,LEDIS_CMD_INLINE},
     {"set",3,LEDIS_CMD_BULK},
     {"setnx",3,LEDIS_CMD_BULK},
-    {"del",2,LEDIS_CMD_INLINE},
+    {"del",-2,LEDIS_CMD_INLINE},
     {"exists",2,LEDIS_CMD_INLINE},
     {"incr",2,LEDIS_CMD_INLINE},
     {"decr",2,LEDIS_CMD_INLINE},
@@ -49,13 +49,19 @@ static struct ledisCommand cmdTable[] = {
     {"lrem",4,LEDIS_CMD_BULK},
     {"sadd",3,LEDIS_CMD_BULK},
     {"srem",3,LEDIS_CMD_BULK},
+    {"smove",4,LEDIS_CMD_BULK},
     {"sismember",3,LEDIS_CMD_BULK},
     {"scard",2,LEDIS_CMD_INLINE},
     {"sinter",-2,LEDIS_CMD_INLINE},
     {"sinterstore",-3,LEDIS_CMD_INLINE},
+    {"sunion",-2,LEDIS_CMD_INLINE},
+    {"sunionstore",-3,LEDIS_CMD_INLINE},
+    {"sdiff",-2,LEDIS_CMD_INLINE},
+    {"sdiffstore",-3,LEDIS_CMD_INLINE},
     {"smembers",2,LEDIS_CMD_INLINE},
     {"incrby",3,LEDIS_CMD_INLINE},
     {"decrby",3,LEDIS_CMD_INLINE},
+    {"getset",3,LEDIS_CMD_BULK},
     {"randomkey",1,LEDIS_CMD_INLINE},
     {"select",2,LEDIS_CMD_INLINE},
     {"move",3,LEDIS_CMD_INLINE},
@@ -76,6 +82,8 @@ static struct ledisCommand cmdTable[] = {
     {"info",1,LEDIS_CMD_INLINE},
     {"mget",-2,LEDIS_CMD_INLINE},
     {"expire",3,LEDIS_CMD_INLINE},
+    {"ttl",2,LEDIS_CMD_INLINE},
+    {"slaveof",3,LEDIS_CMD_INLINE},
     {NULL,0,0}
 };
 
@@ -310,6 +318,7 @@ static sds readArgFromStdin(void){
 
 int main(int argc, char *argv[]){
 
+    struct ledisCommand *rc;
     config.hostip = "127.0.0.1";
     config.hostport = 6379;
 
@@ -322,13 +331,6 @@ int main(int argc, char *argv[]){
         argvcopy[i] = sdsnew(argv[i]);  //弄成sds
     }
 
-    //命令最后一个参数，可以对应非终端来源，例如管道输出
-    if(!isatty(fileno(stdin))){
-        sds lastarg = readArgFromStdin();
-        argvcopy[argc] = lastarg;
-        argc++;
-    }
-
     if(argc < 1){
         fprintf(stderr, "usage: ledis-cli [-h host] [-p port] cmd arg1 arg2 arg3 ... argN\n");
         fprintf(stderr, "usage: echo \"argN\" | ledis-cli [-h host] [-p port] cmd arg1 arg2 ... arg(N-1)\n");
@@ -336,6 +338,15 @@ int main(int argc, char *argv[]){
         fprintf(stderr, "example: cat /etc/passwd | ledis-cli set my_passwd\n");
         fprintf(stderr, "example: ledis-cli get my_passwd\n");
         exit(EXIT_FAILURE);
+    }
+
+    //最后尝试从其他渠道读取最后一个参数，例如管道
+    if((rc = lookupCommand(argv[0])) != NULL){
+        if(rc->arity > 0 && argc == rc->arity-1){
+            sds lastarg = readArgFromStdin();
+            argvcopy[argc] = lastarg;
+            argc++;
+        }
     }
 
     return cliSendCommand(argc, argvcopy);
