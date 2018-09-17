@@ -37,7 +37,7 @@ typedef struct dictIterator{
     dictEntry *nextEntry;
 } dictIterator;
 
-#define DICT_HT_INITIAL_SIZE    16
+#define DICT_HT_INITIAL_SIZE    4
 
 /*-----------------------宏定义---------------------*/
 #define dictFreeEntryVal(ht, entry) \

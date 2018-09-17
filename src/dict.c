@@ -302,7 +302,7 @@ static int _dictExpandIfNeeded(dict *ht){
     return DICT_OK;    //都会返回OK
 }
 
-static unsigned long _dictNextPower(unsigned int size){
+static unsigned long _dictNextPower(unsigned long size){
     //返回的都是16的倍数
     unsigned long i = DICT_HT_INITIAL_SIZE;
     if(size >= LONG_MAX) return LONG_MAX;

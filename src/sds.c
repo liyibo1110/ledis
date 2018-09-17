@@ -1,3 +1,5 @@
+#define SDS_ABORT_ON_OOM
+
 #include "sds.h"
 #include "zmalloc.h"
 #include <stdio.h>

@@ -5,7 +5,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#define _USE_POSIX199309
 #include <signal.h>
+#include <execinfo.h>
+#include <ucontext.h>
 #include <sys/wait.h>
 
 #include <errno.h>
@@ -21,8 +24,10 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <limits.h>
+#include <execinfo.h>
 #include <stdbool.h>
 
+#include "ledis.h"
 #include "ae.h"
 #include "sds.h"
 #include "anet.h"
@@ -32,7 +37,9 @@
 #include "lzf.h"
 #include "pqsort.h"
 
-#define LEDIS_VERSION "0.100"
+#include "config.h"
+
+#define LEDIS_VERSION "0.900"
 
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
@@ -45,10 +52,12 @@
 #define LEDIS_OBJFREELIST_MAX 1000000 //obj池子最大数目
 #define LEDIS_MAX_SYNC_TIME 60 //
 #define LEDIS_EXPIRELOOKUPS_PER_CRON 100    //每秒尝试最多淘汰100个key
+#define LEDIS_MAX_WRITE_PER_EVENT (1024*64)
+#define LEDIS_REQUEST_MAX_SIZE (1024*1024*256)  //inline command最大256M
 
 /*========== Hash table 相关==========*/
 #define LEDIS_HT_MINFILL    10  //dict实际占用百分数，小于这个比率就会尝试再收缩（前提是扩张过）
-#define LEDIS_HT_MINSLOTS   16384   //最小容量，如果不扩长，也就不会继续收缩
+//#define LEDIS_HT_MINSLOTS   16384   //最小容量，如果不扩长，也就不会继续收缩
 
 
 /*========== 返回错误代码 ==========*/
@@ -58,6 +67,7 @@
 /*========== 命令类型 ==========*/
 #define LEDIS_CMD_BULK  1
 #define LEDIS_CMD_INLINE    2
+#define LEDIS_CMD_DENYOOM   4   //追加标记，有这个的command在超过maxmemory时返回错误   
 
 /*========== 对象类型 ==========*/
 #define LEDIS_STRING    0
@@ -198,7 +208,8 @@ struct ledisServer{
     int daemonize;
     char *pidfile;
     int bgsaveinprogress;   //是否正在bgsave，其实是个bool
-    
+    pid_t bgsavechildpid;
+
     struct saveparam *saveparams;
     int saveparamslen;
     char *logfile;
@@ -215,6 +226,7 @@ struct ledisServer{
     int replstate;
     
     unsigned int maxclients;
+    unsigned int maxmemory;
 
     /*======排序相关======*/
     int sort_desc;
@@ -232,6 +244,12 @@ struct ledisCommand{
     int arity;
     int flags;   //是块类命令，还是内联命令
 };
+
+struct ledisFunctionSym{
+    char *name;
+    unsigned long pointer;
+};
+
 
 //进一步封装obj结构，增加了排序相关的辅助字段
 typedef struct _ledisSortObject{
@@ -281,8 +299,12 @@ static int deleteIfVolatile(ledisDb *db, lobj *key);
 static int deleteKey(ledisDb *db, lobj *key);
 static time_t getExpire(ledisDb *db, lobj *key);
 static int setExpire(ledisDb *db, lobj *key, time_t when);
-static void updateSalvesWaitingBgsave(int bgsaveerr);   //貌似单词拼错了
+static void updateSlavesWaitingBgsave(int bgsaveerr);   //貌似单词拼错了
 
+static void freeMemoryIfNeeded(void);
+static int processCommand(ledisClient *c);
+static void setupSigSegvAction(void);
+static void ldbRemoveTempFile(pid_t childpid);
 
 //所有函数均只在本文件被调用
 static void authCommand(ledisClient *c);
@@ -303,7 +325,7 @@ static void decrCommand(ledisClient *c);
 static void incrbyCommand(ledisClient *c);
 static void decrbyCommand(ledisClient *c);
 static void selectCommand(ledisClient *c);
-static void randomKeyCommand(ledisClient *c);
+static void randomkeyCommand(ledisClient *c);
 static void lastsaveCommand(ledisClient *c);
 static void shutdownCommand(ledisClient *c);
 
@@ -327,6 +349,7 @@ static void sremCommand(ledisClient *c);
 static void smoveCommand(ledisClient *c);
 static void sismemberCommand(ledisClient *c);
 static void scardCommand(ledisClient *c);
+static void spopCommand(ledisClient *c);
 static void sinterCommand(ledisClient *c);
 static void sinterstoreCommand(ledisClient *c);
 static void sunionCommand(ledisClient *c);
@@ -347,47 +370,49 @@ static void expireCommand(ledisClient *c);
 static void getSetCommand(ledisClient *c);
 static void ttlCommand(ledisClient *c);
 static void slaveofCommand(ledisClient *c);
+static void debugCommand(ledisClient *c);
 
 /*====================================== 全局变量 ===============================*/
 static struct ledisServer server;
 static struct ledisCommand cmdTable[] = {
-    {"set",setCommand,3,LEDIS_CMD_BULK},
-    {"setnx",setnxCommand,3,LEDIS_CMD_BULK},
     {"get",getCommand,2,LEDIS_CMD_INLINE},
+    {"set",setCommand,3,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
+    {"setnx",setnxCommand,3,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
     {"del",delCommand,-2,LEDIS_CMD_INLINE},
     {"exists",existsCommand,2,LEDIS_CMD_INLINE},
-    {"incr",incrCommand,2,LEDIS_CMD_INLINE},
-    {"decr",decrCommand,2,LEDIS_CMD_INLINE},
+    {"incr",incrCommand,2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"decr",decrCommand,2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
     {"mget",mgetCommand,-2,LEDIS_CMD_INLINE},
-    {"lpush",lpushCommand,3,LEDIS_CMD_BULK},
-    {"rpush",rpushCommand,3,LEDIS_CMD_BULK},
+    {"lpush",lpushCommand,3,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
+    {"rpush",rpushCommand,3,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
     {"lpop",lpopCommand,2,LEDIS_CMD_INLINE},
     {"rpop",rpopCommand,2,LEDIS_CMD_INLINE},
     {"llen",llenCommand,2,LEDIS_CMD_INLINE},
     {"lindex",lindexCommand,3,LEDIS_CMD_INLINE},
-    {"lset",lsetCommand,4,LEDIS_CMD_BULK},
+    {"lset",lsetCommand,4,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
     {"lrange",lrangeCommand,4,LEDIS_CMD_INLINE},
     {"ltrim",ltrimCommand,4,LEDIS_CMD_INLINE},
     {"lrem",lremCommand,4,LEDIS_CMD_BULK},
 
-    {"sadd",saddCommand,3,LEDIS_CMD_BULK},
+    {"sadd",saddCommand,3,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
     {"srem",sremCommand,3,LEDIS_CMD_BULK},
     {"smove",smoveCommand,4,LEDIS_CMD_BULK},
     {"sismember",sismemberCommand,3,LEDIS_CMD_BULK},
     {"scard",scardCommand,2,LEDIS_CMD_INLINE},
-    {"sinter",sinterCommand,-2,LEDIS_CMD_INLINE},
-    {"sinterstore",sinterstoreCommand,-3,LEDIS_CMD_INLINE},
-    {"sunion",sunionCommand,-2,LEDIS_CMD_INLINE},
-    {"sunionstore",sunionstoreCommand,-3,LEDIS_CMD_INLINE},
-    {"sdiff",sdiffCommand,-2,LEDIS_CMD_INLINE},
-    {"sdiffstore",sdiffstoreCommand,-3,LEDIS_CMD_INLINE},
+    {"spop",spopCommand,2,LEDIS_CMD_INLINE},
+    {"sinter",sinterCommand,-2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"sinterstore",sinterstoreCommand,-3,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"sunion",sunionCommand,-2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"sunionstore",sunionstoreCommand,-3,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"sdiff",sdiffCommand,-2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"sdiffstore",sdiffstoreCommand,-3,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
     {"smembers",sinterCommand,2,LEDIS_CMD_INLINE},
 
-    {"incrby",incrbyCommand,2,LEDIS_CMD_INLINE},
-    {"decrby",decrbyCommand,2,LEDIS_CMD_INLINE},
-    {"getset",getSetCommand,3,LEDIS_CMD_BULK},
+    {"incrby",incrbyCommand,2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"decrby",decrbyCommand,2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
+    {"getset",getSetCommand,3,LEDIS_CMD_BULK|LEDIS_CMD_DENYOOM},
 
-    {"randomkey",randomKeyCommand,1,LEDIS_CMD_INLINE},
+    {"randomkey",randomkeyCommand,1,LEDIS_CMD_INLINE},
     {"select",selectCommand,2,LEDIS_CMD_INLINE},
     {"move",moveCommand,3,LEDIS_CMD_INLINE},
     {"rename",renameCommand,3,LEDIS_CMD_INLINE},
@@ -406,11 +431,12 @@ static struct ledisCommand cmdTable[] = {
     {"sync",syncCommand,1,LEDIS_CMD_INLINE},
     {"flushdb",flushdbCommand,1,LEDIS_CMD_INLINE},
     {"flushall",flushallCommand,1,LEDIS_CMD_INLINE},
-    {"sort",sortCommand,-2,LEDIS_CMD_INLINE},
+    {"sort",sortCommand,-2,LEDIS_CMD_INLINE|LEDIS_CMD_DENYOOM},
     {"info",infoCommand,1,LEDIS_CMD_INLINE},
     {"monitor",monitorCommand,1,LEDIS_CMD_INLINE},
     {"ttl",ttlCommand,2,LEDIS_CMD_INLINE},
     {"slaveof",slaveofCommand,3,LEDIS_CMD_INLINE},
+    {"debug",debugCommand,-2,LEDIS_CMD_INLINE},
     {NULL,NULL,0,0}
 };
 
@@ -554,7 +580,7 @@ int stringmatchlen(const char *pattern, int patternLen,
     return 0;
 }
 
-void ledisLog(int level, const char *fmt, ...){
+static void ledisLog(int level, const char *fmt, ...){
     va_list ap;
 
     FILE *fp = server.logfile == NULL ? stdout : fopen(server.logfile, "a");
@@ -644,7 +670,7 @@ dictType setDictType = {
 /**
  * 关闭所有超时的客户端，在别的文件里调用，不能是static函数
  */ 
-void closeTimedoutClients(void){
+static void closeTimedoutClients(void){
     time_t now = time(NULL);
     listNode *ln;
     ledisClient *c;
@@ -663,19 +689,28 @@ void closeTimedoutClients(void){
 }
 
 /**
- * 尝试resize，给单独提取成函数了
+ * 再次提取成更小的函数，因为2个dict都要resize
  */ 
-void tryResizeHashTables(void){
+static int htNeedsResize(dict *dict){
+    long long size = dictSlots(dict);
+    long long used = dictSize(dict);
+    return (size && used && size > DICT_HT_INITIAL_SIZE && 
+            (used * 100 / size < LEDIS_HT_MINFILL));
+}
+
+/**
+ * 尝试数据db和expires的resize
+ */ 
+static void tryResizeHashTables(void){
     //尝试收缩每个HT
     for(int i = 0; i < server.dbnum; i++){
-        //获取总量和实际使用量
-        long long size = dictSlots(server.db[i].dict);
-        long long used = dictSize(server.db[i].dict);
-        if(size && used && size > LEDIS_HT_MINSLOTS && 
-            (used * 100 / size < LEDIS_HT_MINFILL)){
-            ledisLog(LEDIS_NOTICE, "The hash table %d is too sparse, resize it...", i);
+        if(htNeedsResize(server.db[i].dict)){
+            ledisLog(LEDIS_DEBUG, "The hash table %d is too sparse, resize it...", i);
             dictResize(server.db[i].dict);
-            ledisLog(LEDIS_NOTICE, "Hash table %d resized.", i);
+            ledisLog(LEDIS_DEBUG, "Hash table %d resized.", i);
+        }
+        if(htNeedsResize(server.db[i].expires)){
+            dictResize(server.db[i].expires);
         }
     }
 }
@@ -683,7 +718,7 @@ void tryResizeHashTables(void){
 /**
  * timeEvent的回调函数，此版本是每隔1秒执行一次，但不是精确的
  */ 
-int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
+static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
     
     //此版本所有入参都没用到
     LEDIS_NOTUSED(eventLoop);
@@ -701,8 +736,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
         long long used = dictSize(server.db[i].dict);
         long long vkeys = dictSize(server.db[i].expires);
         //差不多每5秒尝试输出一下上述状态
-        if(!(loops % 5) && used > 0){
-            ledisLog(LEDIS_DEBUG, "DB %d: %d keys (%d volatile) in %d slots HT.", i, used, vkeys, size);
+        if(!(loops % 5) && (used || vkeys)){
+            ledisLog(LEDIS_DEBUG, "DB %d: %lld keys (%lld volatile) in %lld slots HT.", i, used, vkeys, size);
             //dictPrintStats(server.dict)
         }
     }    
@@ -732,16 +767,21 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
         //非阻塞式wait
         if(wait4(-1, &statloc, WNOHANG, NULL)){
             int exitcode = WEXITSTATUS(statloc);
-            if(exitcode == 0){  //成功完成
+            int bysignal = WIFSIGNALED(statloc);
+            if(!bysignal && exitcode == 0){  //成功完成
                 ledisLog(LEDIS_NOTICE, "Background saving terminated with success");
                 server.dirty = 0;
                 server.lastsave = time(NULL);
-            }else{
+            }else if(!bysignal && exitcode != 0){   //exitcode不为0
                 ledisLog(LEDIS_WARNING, "Background saving error");
+            }else{  //exitcode为0,但bysignal不为0
+                ledisLog(LEDIS_WARNING, "Background saving terminated by signal");
+                ldbRemoveTempFile(server.bgsavechildpid);
             }
             server.bgsaveinprogress = 0;    //只有在这里还原标记
+            server.bgsavechildpid = -1;
             //通知所有等待bgsave的从们
-            updateSalvesWaitingBgsave(exitcode == 0 ? LEDIS_OK : LEDIS_ERR);
+            updateSlavesWaitingBgsave(exitcode == 0 ? LEDIS_OK : LEDIS_ERR);
         }
     }else{
         //检测是否需要bgsave
@@ -864,7 +904,7 @@ static void initServerConfig(){
     server.requirepass = NULL;
     server.shareobjects = 0;
     server.maxclients = 0;
-
+    server.maxmemory = 0;
     ResetServerSaveParams();
     //给默认的配置
     appendServerSaveParams(60*60, 1);   //1小时后要达到1次变动即save
@@ -886,6 +926,7 @@ static void initServer(){
     //忽略hup和pipe信号的默认行为（终止server进程）
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
+    setupSigSegvAction();
 
     server.clients = listCreate();
     server.slaves = listCreate();
@@ -914,6 +955,7 @@ static void initServer(){
     }
     server.cronloops = 0;
     server.bgsaveinprogress = 0;
+    server.bgsavechildpid = -1;
     server.lastsave = time(NULL);
     server.dirty = 0;
     server.usedmemory = 0;
@@ -955,10 +997,20 @@ static int yesnotoi(char *s){
  * 从配置文件中加载，此版本实现的比较低端，只在启动时被调用一次
  */ 
 static void loadServerConfig(char *filename){
-    FILE *fp = fopen(filename, "r");
+    //FILE *fp = fopen(filename, "r");
+    FILE *fp;
     char buf[LEDIS_CONFIGLINE_MAX+1], *err = NULL;
     int linenum = 0;
     sds line = NULL;
+
+    if(filename[0] == '-' && filename[1] == '\0'){
+        fp = stdin;
+    }else{
+        if((fp = fopen(filename, "r")) == NULL){
+            ledisLog(LEDIS_WARNING, "Fatal error, can't open config file");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     if(!fp){
         ledisLog(LEDIS_WARNING, "Fatal error, can't open config file");
@@ -1022,6 +1074,7 @@ static void loadServerConfig(char *filename){
                 goto loaderr;
             }
         }else if(!strcasecmp(argv[0], "logfile") && argc == 2){
+            FILE *logfp;
             server.logfile = zstrdup(argv[1]);   //需要复制字符串，因为argv是函数范围
             if(!strcasecmp(server.logfile, "stdout")){
                 zfree(server.logfile);
@@ -1029,14 +1082,14 @@ static void loadServerConfig(char *filename){
             }
             if(server.logfile){
                 //如果不是stdout，则需要在这里测试一下文件的可读写性
-                FILE *fp = fopen(server.logfile, "a");
-                if(fp == NULL){
+                logfp = fopen(server.logfile, "a");
+                if(logfp == NULL){
                     //为啥不用sscanf
                     err = sdscatprintf(sdsempty(), 
                         "Can't open the log file: %s", strerror(errno));
                     goto loaderr;
                 }
-                fclose(fp);
+                fclose(logfp);
             }
         }else if(!strcasecmp(argv[0], "databases") && argc == 2){
             //dbnum的值在这里可能变了，但是dict数组已经在之前已经分配16组空间了，疑似BUG
@@ -1046,8 +1099,10 @@ static void loadServerConfig(char *filename){
                 err = "Invalid number of databases";
                 goto loaderr;
             }
-        }else if(!strcasecmp(argv[0], "maxclients") && argv == 2){
+        }else if(!strcasecmp(argv[0], "maxclients") && argc == 2){
             server.maxclients = atoi(argv[1]);
+        }else if(!strcasecmp(argv[0], "maxmemory") && argc == 2){
+            server.maxmemory = atoi(argv[1]);
         }else if(!strcasecmp(argv[0], "slaveof") && argc ==3){
             server.masterhost = sdsnew(argv[1]);
             server.masterport = atoi(argv[2]);
@@ -1060,6 +1115,12 @@ static void loadServerConfig(char *filename){
         }else if(!strcasecmp(argv[0], "shareobjects") && argc == 2){
             if((server.shareobjects = yesnotoi(argv[1])) == -1){
                 err = "argument must be 'yes' or 'no'";
+                goto loaderr;
+            }
+        }else if(!strcasecmp(argv[0], "shareobjectspoolsize") && argc == 2){
+            server.sharingpoolsize = atoi(argv[1]);
+            if(server.sharingpoolsize < 1){
+                err = "invalid object sharing pool size";
                 goto loaderr;
             }
         }else if(!strcasecmp(argv[0], "daemonize") && argc == 2){
@@ -1084,7 +1145,7 @@ static void loadServerConfig(char *filename){
         zfree(argv);
         sdsfree(line);
     }
-    fclose(fp);
+    if(fp != stdin) fclose(fp);
     return;
 
 loaderr:{
@@ -1213,6 +1274,9 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
             listDelNode(c->reply, listFirst(c->reply));
             c->sentlen = 0;
         }
+
+        //最大64k
+        if(totwritten > LEDIS_MAX_WRITE_PER_EVENT) break;
         //printf("reply over.\n");
     }
     if(nwritten == -1){
@@ -1259,6 +1323,8 @@ static void resetClient(ledisClient *c){
  */ 
 static int processCommand(ledisClient *c){
 
+    if(server.maxmemory) freeMemoryIfNeeded();
+
     if(!strcasecmp(c->argv[0]->ptr, "quit")){
         freeClient(c);
         return 0;
@@ -1273,6 +1339,10 @@ static int processCommand(ledisClient *c){
     }else if((cmd->arity > 0 && cmd->arity != c->argc) || 
                 (-cmd->arity > c->argc)){    //arity可以是负数了（代表参数必须大于arity），但也和argc有限制关系
         addReplySds(c, sdsnew("-ERR wrong number of arguments\r\n"));
+        resetClient(c);
+        return 1;
+    }else if(server.maxmemory && cmd->flags & LEDIS_CMD_DENYOOM && zmalloc_used_memory() > server.maxmemory){
+        addReplySds(c, sdsnew("-ERR command not allowed when used memory > 'maxmemory'\r\n"));
         resetClient(c);
         return 1;
     }else if(cmd->flags == LEDIS_CMD_BULK && c->bulklen == -1){
@@ -1486,7 +1556,7 @@ again:
             zfree(argv); //split调用者还要负责回收
             //开始执行客户端命令，如果还有bulk数据或者后面还有新命令，还会回来继续判断
             if(processCommand(c) && sdslen(c->querybuf))    goto again;
-        }else if(sdslen(c->querybuf) >= 1024*32){
+        }else if(sdslen(c->querybuf) >= LEDIS_REQUEST_MAX_SIZE){
             ledisLog(LEDIS_DEBUG, "Client protocol error");
             freeClient(c);
             return;
@@ -1603,7 +1673,7 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask){
         listLength(server.clients) > server.maxclients){
         char *err = "-ERR max number of clients reached\r\n";
         //直接在这里用write回复
-        (void)write(c->fd, err, strlen(err));
+        (void) write(c->fd, err, strlen(err));
         freeClient(c);
         return;
     }
@@ -1848,7 +1918,7 @@ static int ldbSaveLen(FILE *fp, uint32_t len){
  * 将s中的字符串，判断是不是纯数字（例如123或-1234）如果是，则根据位数转存到enc数组里（静态5个字节），位数不同占用空间不同
  * 返回值为enc填充了的字节数
  */ 
-int ldbTryIntegerEncoding(sds s, unsigned char *enc){
+static int ldbTryIntegerEncoding(sds s, unsigned char *enc){
     
     char *endptr, buf[32];
     long long value = strtoll(s, &endptr, 10);
@@ -1941,7 +2011,7 @@ static int ldbSave(char *filename){
     char tmpfile[256];
     time_t now = time(NULL);
     //建立临时文件
-    snprintf(tmpfile, 256, "temp-%d.%ld.ldb", (int)time(NULL), (long int)random());
+    snprintf(tmpfile, 256, "temp-%d.ldb", (int)getpid());
 
     FILE *fp = fopen(tmpfile, "w");
     if(!fp){
@@ -2059,9 +2129,19 @@ static int ldbSaveBackground(char *filename){
         }
         ledisLog(LEDIS_NOTICE, "Background saving started by pid %d", childpid);
         server.bgsaveinprogress = 1;    //在serverCron中才能得到子进程完毕的事件
+        server.bgsavechildpid = childpid;
         return LEDIS_OK;
     }
     return LEDIS_OK;    //到不了这里
+}
+
+/**
+ * 删除临时文件
+ */ 
+static void ldbRemoveTempFile(pid_t childpid){
+    char tmpfile[256];
+    snprintf(tmpfile, 256, "temp-%d.ldb", (int)childpid);
+    unlink(tmpfile);
 }
 
 static int ldbLoadType(FILE *fp){
@@ -2583,6 +2663,14 @@ static void bgsaveCommand(ledisClient *c){
 }
 
 static void shutdownCommand(ledisClient *c){
+    
+    //如果正在bgsave，强制干掉这个子进程
+    if(server.bgsaveinprogress){
+        ledisLog(LEDIS_WARNING, "There is a live saving child. Killing it!");
+        kill(server.bgsavechildpid, SIGKILL);
+        ldbRemoveTempFile(server.bgsavechildpid);
+    }
+    
     ledisLog(LEDIS_WARNING, "User requested shutdown, saving DB...");
     if(ldbSave(server.dbfilename) == LEDIS_OK){
         //删除pid文件
@@ -2915,8 +3003,8 @@ static void ltrimCommand(ledisClient *c){
                 node = listLast(list);
                 listDelNode(list, node);
             }
-            addReply(c, shared.ok);
             server.dirty++; //只算一次变动
+            addReply(c, shared.ok);
             return;
         }else{
             addReply(c, shared.wrongtypeerr);
@@ -2929,7 +3017,7 @@ static void lremCommand(ledisClient *c){
     
     lobj *o = lookupKeyWrite(c->db, c->argv[1]);
     if(o == NULL){
-        addReply(c, shared.nokeyerr);
+        addReply(c, shared.czero);
         return;
     }else{
         if(o->type != LEDIS_LIST){
@@ -3005,6 +3093,8 @@ static void sremCommand(ledisClient *c){
             //尝试删除里面dict的key（也就是单个元素）
             if(dictDelete(set->ptr, c->argv[2]) == DICT_OK){
                 server.dirty++;
+                //dict里数目变少了，就要尝试收缩
+                if(htNeedsResize(set->ptr)) dictResize(set->ptr);
                 addReply(c, shared.cone);
             }else{
                 addReply(c, shared.czero);
@@ -3080,6 +3170,33 @@ static void scardCommand(ledisClient *c){
         dict *s = o->ptr;
         addReplySds(c, sdscatprintf(sdsempty(), ":%d\r\n", dictSize(s)));
         return;
+    }
+}
+
+static void spopCommand(ledisClient *c){
+
+    dictEntry *de;
+    lobj *set = lookupKeyWrite(c->db, c->argv[1]);
+    if(set == NULL){
+        addReply(c, shared.nullbulk);
+    }else{
+        if(set->type != LEDIS_SET){
+            addReply(c, shared.wrongtypeerr);
+            return;
+        }
+        de = dictGetRandomKey(set->ptr);
+        if(de == NULL){
+            addReply(c, shared.nullbulk);
+        }else{
+            lobj *ele = dictGetEntryKey(de);
+            addReplySds(c, sdscatprintf(sdsempty(), "$%d\r\n", sdslen(ele->ptr)));
+            addReply(c, ele);
+            addReply(c, shared.crlf);
+            //返回了就可以删了
+            dictDelete(set->ptr, ele);
+            if(htNeedsResize(set->ptr)) dictResize(set->ptr);
+            server.dirty++;
+        }
     }
 }
 
@@ -3304,7 +3421,7 @@ static void flushallCommand(ledisClient *c){
     server.dirty++; //啥意思？
 }
 
-ledisSortOperation *createSortOperation(int type, lobj *pattern){
+static ledisSortOperation *createSortOperation(int type, lobj *pattern){
     ledisSortOperation *so = zmalloc(sizeof(*so));
     if(!so) oom("createSortOperation");
     so->type = type;
@@ -3315,7 +3432,7 @@ ledisSortOperation *createSortOperation(int type, lobj *pattern){
 /**
  * 根据给定的pattern（必须带替代符*）和特定片段subst一起当作key，查找并返回对应的val
  */ 
-lobj *lookupKeyByPattern(ledisDb *db, lobj *pattern, lobj *subst){
+static lobj *lookupKeyByPattern(ledisDb *db, lobj *pattern, lobj *subst){
     
     //内部匿名struct
     struct{
@@ -3548,7 +3665,7 @@ static void sortCommand(ledisClient *c){
         }
         //输出运算参数对应的内容
         listRewind(operations);
-        while(ln = listYield(operations)){
+        while((ln = listYield(operations))){
             ledisSortOperation *sop = ln->value;
             lobj *val = lookupKeyByPattern(c->db, sop->pattern, vector[j].obj);
             if(sop->type == LEDIS_SORT_GET){
@@ -3619,6 +3736,16 @@ static void infoCommand(ledisClient *c){
                     "up" : "down",
                 (int)(time(NULL)-server.master->lastinteraction));
     }
+
+    for(int i = 0; i < server.dbnum; i++){
+        long long keys = dictSize(server.db[i].dict);
+        long long vkeys = dictSize(server.db[i].expires);
+        if(keys || vkeys){
+            info = sdscatprintf(info, "db%d: keys=%lld, expires=%lld\r\n",
+                    i, keys, vkeys);
+        }
+    }
+
     addReplySds(c, sdscatprintf(sdsempty(), "$%d\r\n", sdslen(info)));
     addReplySds(c, info);
     addReply(c, shared.crlf);
@@ -3736,26 +3863,6 @@ static void ttlCommand(ledisClient *c){
 }
 
 /*====================================== 主从相关 ===============================*/
-
-/**
- * 发送所有未发的reply到客户端（即调sync命令的一端，从服务端），只在主从功能中被使用
- */ 
-static int flushClientOutput(ledisClient *c){
-    
-    int retval;
-    time_t start = time(NULL);
-
-    while(listLength(c->reply)){
-        if(time(NULL)-start > 5) return LEDIS_ERR;  //只让运行5秒
-        retval = aeWait(c->fd, AE_WRITABLE, 1000);
-        if(retval == -1){
-            return LEDIS_ERR;
-        }else if(retval & AE_WRITABLE){
-            sendReplyToClient(NULL, c->fd, c, AE_WRITABLE);
-        }
-    }
-    return LEDIS_OK;
-}
 
 /**
  * 本质还是调用write向fd写入数据，但要以间歇的方式，并且考虑数据分批
@@ -3929,7 +4036,7 @@ static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask){
 /**
  * 由serverCron中检测如果bgsave完成时才会调用
  */ 
-static void updateSalvesWaitingBgsave(int bgsaveerr){
+static void updateSlavesWaitingBgsave(int bgsaveerr){
 
     listNode *ln;
     int startbgsave = 0;
@@ -3941,7 +4048,7 @@ static void updateSalvesWaitingBgsave(int bgsaveerr){
             startbgsave = 1;
             slave->replstate = LEDIS_REPL_WAIT_BGSAVE_END;
         }else if(slave->replstate == LEDIS_REPL_WAIT_BGSAVE_END){
-            struct stat buf;
+            struct ledis_stat buf;
             if(bgsaveerr != LEDIS_OK){  //说明bgsave失败了
                 freeClient(slave);
                 ledisLog(LEDIS_WARNING, "SYNC failed. BGSAVE child returned an error");
@@ -3949,7 +4056,7 @@ static void updateSalvesWaitingBgsave(int bgsaveerr){
             }
             //说明bgsave正常返回
             if((slave->repldbfd = open(server.dbfilename, O_RDONLY)) == -1 || 
-                fstat(slave->repldbfd, &buf) == -1){
+                ledis_fstat(slave->repldbfd, &buf) == -1){
                 freeClient(slave);
                 ledisLog(LEDIS_WARNING, "SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
                 continue;
@@ -4080,6 +4187,267 @@ static void slaveofCommand(ledisClient *c){
     }
     addReply(c, shared.ok);
 }
+
+/*====================================== 最大内存相关 ===============================*/
+/**
+ * 内存满了，尝试删一个对象（感觉不实用，只是个试水版）
+ */ 
+static void freeMemoryIfNeeded(void){
+    while(server.maxmemory && zmalloc_used_memory() > server.maxmemory){
+        //先尝试删除objfreelist里面的对象
+        if(listLength(server.objfreelist)){
+            listNode *head = listFirst(server.objfreelist);
+            lobj *o = listNodeValue(head);
+            listDelNode(server.objfreelist, head);
+            zfree(o);
+        }else{  //第二方案是删除设置的expire的key/val，原则是删expire马上要到期的
+            int freed = 0;
+            for(int i = 0; i < server.dbnum; i++){
+                int minttl = -1;
+                lobj *minkey = NULL;
+                dictEntry *de;
+                if(dictSize(server.db[i].expires)){
+                    freed = 1;  //标记是否删除了expires的数据
+                    //只尝试找3个key，不会找出绝对最小的ttl
+                    for(int j = 0; j < 3; j++){
+                        de = dictGetRandomKey(server.db[i].expires);
+                        time_t t = (time_t)dictGetEntryKey(de);
+                        if(minttl == -1 || t < minttl){
+                            minkey = dictGetEntryKey(de);
+                            minttl = t;
+                        }
+                    }
+                    deleteKey(server.db+i, minkey);
+                }
+            }
+            //如果俩方案都行不通，直接退出
+            if(!freed) return; 
+        }
+    }
+}
+
+/*====================================== DEBUG相关 ===============================*/
+
+static void debugCommand(ledisClient *c){
+    if(!strcasecmp(c->argv[1]->ptr, "segfault")){
+        *((char*)-1) = 'x'; //故意产生一个segfault错误
+    }else if(!strcasecmp(c->argv[1]->ptr, "object") && c->argc == 3){
+        dictEntry *de = dictFind(c->db->dict, c->argv[2]);
+        if(!de){
+            addReply(c, shared.nokeyerr);
+            return;
+        }
+        lobj *key = dictGetEntryKey(de);
+        lobj *val = dictGetEntryVal(de);
+        addReplySds(c, sdscatprintf(sdsempty(), 
+                    "+KEY at:%p refcount:%d, value at:%p refcount:%d\r\n",
+                    key, key->refcount, val, val->refcount));
+    }else{
+        addReplySds(c, sdsnew("-ERR Syntax error, try DEBUG [SEGFAULT|OBJECT <key>]\r\n"));
+    }
+}
+
+#ifdef HAVE_BACKTRACE
+static struct ledisFunctionSym symsTable[] = {
+{"freeStringObject", (unsigned long)freeStringObject},
+{"freeListObject", (unsigned long)freeListObject},
+{"freeSetObject", (unsigned long)freeSetObject},
+{"decrRefCount", (unsigned long)decrRefCount},
+{"createObject", (unsigned long)createObject},
+{"freeClient", (unsigned long)freeClient},
+{"rdbLoad", (unsigned long)ldbLoad},
+{"addReply", (unsigned long)addReply},
+{"addReplySds", (unsigned long)addReplySds},
+{"incrRefCount", (unsigned long)incrRefCount},
+{"rdbSaveBackground", (unsigned long)ldbSaveBackground},
+{"createStringObject", (unsigned long)createStringObject},
+{"replicationFeedSlaves", (unsigned long)replicationFeedSlaves},
+{"syncWithMaster", (unsigned long)syncWithMaster},
+{"tryObjectSharing", (unsigned long)tryObjectSharing},
+{"removeExpire", (unsigned long)removeExpire},
+{"expireIfNeeded", (unsigned long)expireIfNeeded},
+{"deleteIfVolatile", (unsigned long)deleteIfVolatile},
+{"deleteKey", (unsigned long)deleteKey},
+{"getExpire", (unsigned long)getExpire},
+{"setExpire", (unsigned long)setExpire},
+{"updateSlavesWaitingBgsave", (unsigned long)updateSlavesWaitingBgsave},
+{"freeMemoryIfNeeded", (unsigned long)freeMemoryIfNeeded},
+{"authCommand", (unsigned long)authCommand},
+{"pingCommand", (unsigned long)pingCommand},
+{"echoCommand", (unsigned long)echoCommand},
+{"setCommand", (unsigned long)setCommand},
+{"setnxCommand", (unsigned long)setnxCommand},
+{"getCommand", (unsigned long)getCommand},
+{"delCommand", (unsigned long)delCommand},
+{"existsCommand", (unsigned long)existsCommand},
+{"incrCommand", (unsigned long)incrCommand},
+{"decrCommand", (unsigned long)decrCommand},
+{"incrbyCommand", (unsigned long)incrbyCommand},
+{"decrbyCommand", (unsigned long)decrbyCommand},
+{"selectCommand", (unsigned long)selectCommand},
+{"randomkeyCommand", (unsigned long)randomkeyCommand},
+{"keysCommand", (unsigned long)keysCommand},
+{"dbsizeCommand", (unsigned long)dbsizeCommand},
+{"lastsaveCommand", (unsigned long)lastsaveCommand},
+{"saveCommand", (unsigned long)saveCommand},
+{"bgsaveCommand", (unsigned long)bgsaveCommand},
+{"shutdownCommand", (unsigned long)shutdownCommand},
+{"moveCommand", (unsigned long)moveCommand},
+{"renameCommand", (unsigned long)renameCommand},
+{"renamenxCommand", (unsigned long)renamenxCommand},
+{"lpushCommand", (unsigned long)lpushCommand},
+{"rpushCommand", (unsigned long)rpushCommand},
+{"lpopCommand", (unsigned long)lpopCommand},
+{"rpopCommand", (unsigned long)rpopCommand},
+{"llenCommand", (unsigned long)llenCommand},
+{"lindexCommand", (unsigned long)lindexCommand},
+{"lrangeCommand", (unsigned long)lrangeCommand},
+{"ltrimCommand", (unsigned long)ltrimCommand},
+{"typeCommand", (unsigned long)typeCommand},
+{"lsetCommand", (unsigned long)lsetCommand},
+{"saddCommand", (unsigned long)saddCommand},
+{"sremCommand", (unsigned long)sremCommand},
+{"smoveCommand", (unsigned long)smoveCommand},
+{"sismemberCommand", (unsigned long)sismemberCommand},
+{"scardCommand", (unsigned long)scardCommand},
+{"spopCommand", (unsigned long)spopCommand},
+{"sinterCommand", (unsigned long)sinterCommand},
+{"sinterstoreCommand", (unsigned long)sinterstoreCommand},
+{"sunionCommand", (unsigned long)sunionCommand},
+{"sunionstoreCommand", (unsigned long)sunionstoreCommand},
+{"sdiffCommand", (unsigned long)sdiffCommand},
+{"sdiffstoreCommand", (unsigned long)sdiffstoreCommand},
+{"syncCommand", (unsigned long)syncCommand},
+{"flushdbCommand", (unsigned long)flushdbCommand},
+{"flushallCommand", (unsigned long)flushallCommand},
+{"sortCommand", (unsigned long)sortCommand},
+{"lremCommand", (unsigned long)lremCommand},
+{"infoCommand", (unsigned long)infoCommand},
+{"mgetCommand", (unsigned long)mgetCommand},
+{"monitorCommand", (unsigned long)monitorCommand},
+{"expireCommand", (unsigned long)expireCommand},
+{"getSetCommand", (unsigned long)getSetCommand},
+{"ttlCommand", (unsigned long)ttlCommand},
+{"slaveofCommand", (unsigned long)slaveofCommand},
+{"debugCommand", (unsigned long)debugCommand},
+{"processCommand", (unsigned long)processCommand},
+{"setupSigSegvAction", (unsigned long)setupSigSegvAction},
+{"readQueryFromClient", (unsigned long)readQueryFromClient},
+{"rdbRemoveTempFile", (unsigned long)ldbRemoveTempFile},
+{NULL,0}
+};
+
+/* This function try to convert a pointer into a function name. It's used in
+ * oreder to provide a backtrace under segmentation fault that's able to
+ * display functions declared as static (otherwise the backtrace is useless). */
+static char *findFuncName(void *pointer, unsigned long *offset){
+    int i, ret = -1;
+    unsigned long off, minoff = 0;
+
+    /* Try to match against the Symbol with the smallest offset */
+    for (i=0; symsTable[i].pointer; i++) {
+        unsigned long lp = (unsigned long) pointer;
+
+        if (lp != (unsigned long)-1 && lp >= symsTable[i].pointer) {
+            off=lp-symsTable[i].pointer;
+            if (ret < 0 || off < minoff) {
+                minoff=off;
+                ret=i;
+            }
+        }
+    }
+    if (ret == -1) return NULL;
+    *offset = minoff;
+    return symsTable[ret].name;
+}
+
+static void *getMcontextEip(ucontext_t *uc) {
+#if defined(__FreeBSD__)
+    return (void*) uc->uc_mcontext.mc_eip;
+#elif defined(__dietlibc__)
+    return (void*) uc->uc_mcontext.eip;
+#elif defined(__APPLE__)
+    return (void*) uc->uc_mcontext->__ss.__eip;
+#else /* Linux */
+    return (void*) uc->uc_mcontext.gregs[REG_EIP];
+#endif
+}
+
+static void segvHandler(int sig, siginfo_t *info, void *secret) {
+    void *trace[100];
+    char **messages = NULL;
+    int i, trace_size = 0;
+    unsigned long offset=0;
+    time_t uptime = time(NULL)-server.stat_starttime;
+    ucontext_t *uc = (ucontext_t*) secret;
+    REDIS_NOTUSED(info);
+
+    redisLog(REDIS_WARNING,
+        "======= Ooops! Redis %s got signal: -%d- =======", REDIS_VERSION, sig);
+    redisLog(REDIS_WARNING, "%s", sdscatprintf(sdsempty(),
+        "redis_version:%s; "
+        "uptime_in_seconds:%d; "
+        "connected_clients:%d; "
+        "connected_slaves:%d; "
+        "used_memory:%zu; "
+        "changes_since_last_save:%lld; "
+        "bgsave_in_progress:%d; "
+        "last_save_time:%d; "
+        "total_connections_received:%lld; "
+        "total_commands_processed:%lld; "
+        "role:%s;"
+        ,REDIS_VERSION,
+        uptime,
+        listLength(server.clients)-listLength(server.slaves),
+        listLength(server.slaves),
+        server.usedmemory,
+        server.dirty,
+        server.bgsaveinprogress,
+        server.lastsave,
+        server.stat_numconnections,
+        server.stat_numcommands,
+        server.masterhost == NULL ? "master" : "slave"
+    ));
+    
+    trace_size = backtrace(trace, 100);
+    /* overwrite sigaction with caller's address */
+    trace[1] = getMcontextEip(uc);
+    messages = backtrace_symbols(trace, trace_size);
+
+    for (i=1; i<trace_size; ++i) {
+        char *fn = findFuncName(trace[i], &offset), *p;
+
+        p = strchr(messages[i],'+');
+        if (!fn || (p && ((unsigned long)strtol(p+1,NULL,10)) < offset)) {
+            redisLog(REDIS_WARNING,"%s", messages[i]);
+        } else {
+            redisLog(REDIS_WARNING,"%d redis-server %p %s + %d", i, trace[i], fn, (unsigned int)offset);
+        }
+    }
+    free(messages);
+    exit(0);
+}
+
+static void setupSigSegvAction(void) {
+    struct sigaction act;
+
+    sigemptyset (&act.sa_mask);
+    /* When the SA_SIGINFO flag is set in sa_flags then sa_sigaction
+     * is used. Otherwise, sa_handler is used */
+    act.sa_flags = SA_NODEFER | SA_ONSTACK | SA_RESETHAND | SA_SIGINFO;
+    act.sa_sigaction = segvHandler;
+    sigaction (SIGSEGV, &act, NULL);
+    sigaction (SIGBUS, &act, NULL);
+    sigaction (SIGFPE, &act, NULL);
+    sigaction (SIGILL, &act, NULL);
+    sigaction (SIGBUS, &act, NULL);
+    return;
+}
+#else /* HAVE_BACKTRACE */
+static void setupSigSegvAction(void) {
+}
+
+#endif /* HAVE_BACKTRACE */
 
 /*====================================== 主函数 ===============================*/
 

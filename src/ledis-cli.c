@@ -52,6 +52,7 @@ static struct ledisCommand cmdTable[] = {
     {"smove",4,LEDIS_CMD_BULK},
     {"sismember",3,LEDIS_CMD_BULK},
     {"scard",2,LEDIS_CMD_INLINE},
+    {"spop",2,LEDIS_CMD_INLINE},
     {"sinter",-2,LEDIS_CMD_INLINE},
     {"sinterstore",-3,LEDIS_CMD_INLINE},
     {"sunion",-2,LEDIS_CMD_INLINE},
@@ -84,6 +85,7 @@ static struct ledisCommand cmdTable[] = {
     {"expire",3,LEDIS_CMD_INLINE},
     {"ttl",2,LEDIS_CMD_INLINE},
     {"slaveof",3,LEDIS_CMD_INLINE},
+    {"debug",-2,LEDIS_CMD_INLINE},
     {NULL,0,0}
 };
 

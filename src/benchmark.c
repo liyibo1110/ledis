@@ -424,16 +424,7 @@ int main(int argc, char **argv){
         prepareForBenchmark();
         c = createClient(); //创建一个client
         if(!c) exit(EXIT_FAILURE);
-        c->obuf = sdscat(c->obuf, "PING\r\n");
-        c->replytype = REPLY_RETCODE;   //设置返回的类型
-        createMissingClients(c);    //弄出剩余的client
-        aeMain(config.el);  //开始执行，直到都完成才会返回
-        endBenchmark("PING");
-        
         /*========== 测试SET ==========*/
-        prepareForBenchmark();
-        c = createClient(); //创建一个client
-        if(!c) exit(EXIT_FAILURE);
         c->obuf = sdscatprintf(c->obuf, "SET foo_rand000000000000 %d\r\n", config.datasize);
         {
             char *data = zmalloc(config.datasize+2); //还有\r\n
@@ -489,6 +480,16 @@ int main(int argc, char **argv){
         aeMain(config.el);
         endBenchmark("LPOP");
 
+        /*========== 测试PING ==========*/
+        prepareForBenchmark();
+        c = createClient(); //创建一个client
+        if(!c) exit(EXIT_FAILURE);
+        c->obuf = sdscat(c->obuf, "PING\r\n");
+        c->replytype = REPLY_RETCODE;   //设置返回的类型
+        createMissingClients(c);    //弄出剩余的client
+        aeMain(config.el);  //开始执行，直到都完成才会返回
+        endBenchmark("PING");
+        
         printf("\n");
     }while(config.loop);
 
