@@ -2557,7 +2557,7 @@ static void selectCommand(ledisClient *c){
     }
 }
 
-static void randomKeyCommand(ledisClient *c){
+static void randomkeyCommand(ledisClient *c){
     dictEntry *de;
     
     while(true){
@@ -4380,11 +4380,10 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
     unsigned long offset=0;
     time_t uptime = time(NULL)-server.stat_starttime;
     ucontext_t *uc = (ucontext_t*) secret;
-    REDIS_NOTUSED(info);
+    LEDIS_NOTUSED(info);
 
-    redisLog(REDIS_WARNING,
-        "======= Ooops! Redis %s got signal: -%d- =======", REDIS_VERSION, sig);
-    redisLog(REDIS_WARNING, "%s", sdscatprintf(sdsempty(),
+    ledisLog(LEDIS_WARNING, "======= Ooops! Redis %s got signal: -%d- =======", LEDIS_VERSION, sig);
+    ledisLog(LEDIS_WARNING, "%s", sdscatprintf(sdsempty(),
         "redis_version:%s; "
         "uptime_in_seconds:%d; "
         "connected_clients:%d; "
@@ -4396,7 +4395,7 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
         "total_connections_received:%lld; "
         "total_commands_processed:%lld; "
         "role:%s;"
-        ,REDIS_VERSION,
+        ,LEDIS_VERSION,
         uptime,
         listLength(server.clients)-listLength(server.slaves),
         listLength(server.slaves),
@@ -4419,9 +4418,9 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
 
         p = strchr(messages[i],'+');
         if (!fn || (p && ((unsigned long)strtol(p+1,NULL,10)) < offset)) {
-            redisLog(REDIS_WARNING,"%s", messages[i]);
+            ledisLog(LEDIS_WARNING,"%s", messages[i]);
         } else {
-            redisLog(REDIS_WARNING,"%d redis-server %p %s + %d", i, trace[i], fn, (unsigned int)offset);
+            ledisLog(LEDIS_WARNING,"%d ledis-server.out %p %s + %d", i, trace[i], fn, (unsigned int)offset);
         }
     }
     free(messages);
