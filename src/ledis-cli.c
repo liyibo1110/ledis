@@ -139,7 +139,7 @@ static sds cliReadLine(int fd){
  * 读取并输出inline类型的reply（包含3种，对应SINGLELINE，INT和RETCODE）
  * 返回0说明正常，返回1说明不正常
  */ 
-static int cliReadSingleLineReply(int fd, int type){
+static int cliReadSingleLineReply(int fd){
 
     sds reply = cliReadLine(fd);
     if(reply == NULL) return 1;
@@ -217,6 +217,9 @@ static int cliReadReply(int fd){
         case ':':
             return cliReadSingleLineReply(fd);
         case '$':{
+            return cliReadBulkReply(fd);
+        }
+        case '*':{
             return cliReadMultiBulkReply(fd);
         }
         default:{

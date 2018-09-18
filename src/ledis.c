@@ -1,4 +1,5 @@
 #include "fmacros.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,8 +8,12 @@
 #include <unistd.h>
 #define _USE_POSIX199309
 #include <signal.h>
+
+#ifdef HAVE_BACKTRACE
 #include <execinfo.h>
 #include <ucontext.h>
+#endif
+
 #include <sys/wait.h>
 
 #include <errno.h>
@@ -24,7 +29,6 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <limits.h>
-#include <execinfo.h>
 #include <stdbool.h>
 
 #include "ledis.h"
@@ -37,9 +41,7 @@
 #include "lzf.h"
 #include "pqsort.h"
 
-#include "config.h"
-
-#define LEDIS_VERSION "0.900"
+#define LEDIS_VERSION "1.000"
 
 /*========== server配置相关 ==========*/
 #define LEDIS_SERVERPORT    6379    //默认TCP端口
@@ -748,11 +750,11 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
     //每5秒输出一次状态
     if(!(loops % 5)){
-        ledisLog(LEDIS_DEBUG, "%d clients connected (%d slaves), %zu bytes in use", 
+        ledisLog(LEDIS_DEBUG, "%d clients connected (%d slaves), %zu bytes in use, %d shared objects", 
                 listLength(server.clients)-listLength(server.slaves), 
                 listLength(server.slaves),
                 server.usedmemory,
-                dictSize(server.sharingpool));  //参数对应不上，最后一个没用到
+                dictSize(server.sharingpool));
     }
 
     //差不多每10秒，尝试清理超时的client
@@ -903,6 +905,7 @@ static void initServerConfig(){
     server.dbfilename = "dump.ldb";
     server.requirepass = NULL;
     server.shareobjects = 0;
+    server.sharingpoolsize = 1024;
     server.maxclients = 0;
     server.maxmemory = 0;
     ResetServerSaveParams();
@@ -937,7 +940,6 @@ static void initServer(){
     //初始化db数组，只是分配了dbnum个地址空间，并没有为实际dict结构分配内存
     server.db = zmalloc(sizeof(ledisDb)*server.dbnum);
     server.sharingpool = dictCreate(&setDictType, NULL);
-    server.sharingpoolsize = 1024;
     if(!server.db || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist){
         oom("server initialization");
     }
@@ -1555,7 +1557,7 @@ again:
             }
             zfree(argv); //split调用者还要负责回收
             //开始执行客户端命令，如果还有bulk数据或者后面还有新命令，还会回来继续判断
-            if(processCommand(c) && sdslen(c->querybuf))    goto again;
+            if(c->argc && processCommand(c) && sdslen(c->querybuf))    goto again;
         }else if(sdslen(c->querybuf) >= LEDIS_REQUEST_MAX_SIZE){
             ledisLog(LEDIS_DEBUG, "Client protocol error");
             freeClient(c);
@@ -3845,6 +3847,7 @@ static void expireCommand(ledisClient *c){
         time_t when = time(NULL)+seconds;
         if(setExpire(c->db, c->argv[1], when)){
             addReply(c, shared.cone);
+            server.dirty++;
         }else{
             addReply(c, shared.czero);
         }
@@ -4366,10 +4369,20 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->uc_mcontext.mc_eip;
 #elif defined(__dietlibc__)
     return (void*) uc->uc_mcontext.eip;
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(MAC_OS_X_VERSION_10_6)
     return (void*) uc->uc_mcontext->__ss.__eip;
-#else /* Linux */
+#elif defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
+  #ifdef _STRUCT_X86_THREAD_STATE64
+    return (void*) uc->uc_mcontext->__ss.__rip;
+  #else
+    return (void*) uc->uc_mcontext->__ss.__eip;
+  #endif 
+#elif defined(__i386__) || defined(__X86_64__) /* Linux x86 */
     return (void*) uc->uc_mcontext.gregs[REG_EIP];
+#elif defined(__ia64__) /* Linux IA64 */
+    return (void*) uc->uc_mcontext.sc_ip;
+#else
+    return NULL;
 #endif
 }
 
@@ -4382,7 +4395,7 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
     ucontext_t *uc = (ucontext_t*) secret;
     LEDIS_NOTUSED(info);
 
-    ledisLog(LEDIS_WARNING, "======= Ooops! Redis %s got signal: -%d- =======", LEDIS_VERSION, sig);
+    ledisLog(LEDIS_WARNING, "======= Ooops! Ledis %s got signal: -%d- =======", LEDIS_VERSION, sig);
     ledisLog(LEDIS_WARNING, "%s", sdscatprintf(sdsempty(),
         "redis_version:%s; "
         "uptime_in_seconds:%d; "
@@ -4410,7 +4423,9 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
     
     trace_size = backtrace(trace, 100);
     /* overwrite sigaction with caller's address */
-    trace[1] = getMcontextEip(uc);
+    if(getMcontextEip(uc) != NULL){
+        trace[1] = getMcontextEip(uc);
+    }
     messages = backtrace_symbols(trace, trace_size);
 
     for (i=1; i<trace_size; ++i) {
@@ -4466,7 +4481,7 @@ int linuxOvercommitMemoryValue(void){
 
 void linuxOvercommitMemoryWarning(void){
     if(linuxOvercommitMemoryValue() == 0){
-        ledisLog(LEDIS_WARNING, "WARNING overcommit_memory is set to 0! Background save may fail under low condition memory. To fix this issue add 'echo 1 > /proc/sys/vm/overcommit_memory' in your init scripts.");
+        ledisLog(LEDIS_WARNING,"WARNING overcommit_memory is set to 0! Background save may fail under low condition memory. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.");
     }
 }
 #endif
@@ -4496,10 +4511,6 @@ static void daemonize(void){
 
 int main(int argc, char *argv[]){
 
-#ifdef __linux__
-    linuxOvercommitMemoryWarning();
-#endif
-
     LEDIS_NOTUSED(argc);
     LEDIS_NOTUSED(argv);
     //初始化server配置
@@ -4517,6 +4528,9 @@ int main(int argc, char *argv[]){
     initServer();
     if(server.daemonize) daemonize();
     ledisLog(LEDIS_NOTICE, "Server started, LEDIS version " LEDIS_VERSION);
+#ifdef __linux__
+    linuxOvercommitMemoryWarning();
+#endif    
     //尝试恢复数据库dump.ldb文件
     if(ldbLoad(server.dbfilename) == LEDIS_OK){
         ledisLog(LEDIS_NOTICE, "DB loaded from disk");

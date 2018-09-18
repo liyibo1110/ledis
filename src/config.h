@@ -2,12 +2,16 @@
 #define _CONFIG_H
 
 #ifdef __APPLE__
+#include <AvailabilityMacros.h>
+#endif
+
+#ifdef __APPLE__
 #include <malloc/malloc.h>
 #define HAVE_MALLOC_SIZE 1
 #define ledis_malloc_size(p) malloc_size(p)
 #endif
 
-#ifdef __APPLE__
+#if defined (__APPLE__) && !defined(MAC_OS_X_VERSION_10_6)
 #define ledis_fstat fstat64
 #define ledis_stat stat64
 #else

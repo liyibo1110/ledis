@@ -359,7 +359,7 @@ void parseOptions(int argc, char **argv){
             i++;
             if(config.datasize < 1) config.datasize = 1;
             if(config.datasize > 1024 * 1024) config.datasize = 1024 * 1024;
-        }else if (!strcmp(argv[i], "-r" && !lastarg)){
+        }else if (!strcmp(argv[i], "-r") && !lastarg){
             config.randomkeys = 1;
             config.randomkeys_keyspacelen = atoi(argv[i+1]);
             i++;

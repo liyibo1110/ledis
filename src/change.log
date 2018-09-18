@@ -1,3 +1,12 @@
+1.0变化
+新的配置：无
+新功能：无
+修改BUG：
+1.修正了serverCron周期函数没有打印shardingpool大小的小BUG。
+2.修正了expireCommand成功设置了key的expire，dirty不增加的BUG。
+代码调整：
+1.调整了debug部分代码。
+
 0.9变化
 新的配置：
 1.maxmemory最大可用内存。
@@ -7,7 +16,7 @@
 2.增加了maxmemory的最大限制，超出了先尝试删除expires的key，不行就返回error信息。
 3.增加了spop命令。
 4.增加了debug调试命令，但不是给客户端使用的。
-修改BUG：无
+修改BUG：无z
 代码调整：
 1.dict初始化桶位由16个变成了4个。
 2.Makefile的debug选项，开启了-rdynamic和-ggdb，意图在程序中可以通过函数进行debug操作。
